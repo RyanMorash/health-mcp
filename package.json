@@ -1,44 +1,32 @@
 {
   "name": "@airbloomer/health-mcp",
-  "version": "0.1.1",
-  "description": "Self-hosted health data endpoint. Works with data exported from Apple Health and Android Health Connect, and serves daily summaries.",
-  "keywords": [
-    "health-data",
-    "health-auto-export",
-    "mcp",
-    "self-hosted"
-  ],
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker that stores Health Auto Export and historic Apple Health data and serves it over MCP.",
   "type": "module",
   "license": "MIT",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
-    "start": "node src/adapters/node.js",
-    "test": "node --test test/*.test.mjs"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types",
+    "test": "vitest run",
+    "db:migrate": "wrangler d1 migrations apply health-mcp --remote",
+    "import:apple": "tsx src/cli/import-apple-health.ts"
   },
   "dependencies": {
-    "better-sqlite3": "^11.10.0",
-    "pg": "^8.16.3"
+    "@modelcontextprotocol/server": "2.4.0",
+    "agents": "0.33.0",
+    "zod": "^4.1.12"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Airbloomer/health-mcp.git"
-  },
-  "homepage": "https://github.com/Airbloomer/health-mcp#readme",
-  "bugs": {
-    "url": "https://github.com/Airbloomer/health-mcp/issues"
-  },
-  "files": [
-    "src",
-    "migrations",
-    "README.md",
-    "LICENSE",
-    "SECURITY.md"
-  ],
-  "publishConfig": {
-    "access": "public",
-    "provenance": true,
-    "registry": "https://registry.npmjs.org/"
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.8.1",
+    "@types/node": "^26.6.6",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.0",
+    "wrangler": "4.161.0"
   }
 }

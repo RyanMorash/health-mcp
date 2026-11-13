@@ -21,3 +21,7 @@ The sign-off certifies that you can submit the contribution under the MIT Licens
 - The contribution was provided to you by someone who certified these terms, and you have not modified it.
 
 You understand that the contribution is public, and that a record of the contribution, including the sign-off, is kept and may be redistributed under the MIT License.
+
+## Tests
+
+Node 22 or newer. `npm test` runs the Workers Vitest suite against local D1 and R2. `npx tsc --noEmit` typechecks the Worker and the Apple importer.
