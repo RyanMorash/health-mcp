@@ -105,11 +105,20 @@ function formatZonedDate(ms: number, timeZone: string): string {
   return `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
 }
 
+function zonedMidnight(year: number, month: number, day: number, timeZone: string): number {
+  let utc = Date.UTC(year, month - 1, day);
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const got = zonedParts(utc, timeZone);
+    const delta = Date.UTC(year, month - 1, day) - Date.UTC(got.year, got.month - 1, got.day, got.hour, got.minute, got.second);
+    if (delta === 0) return utc;
+    utc += delta;
+  }
+  return utc;
+}
+
 function nextZonedMidnight(ms: number, timeZone: string): number {
-  const probe = zonedParts(ms + 26 * 3_600_000, timeZone);
-  const midnightWall = Date.UTC(probe.year, probe.month - 1, probe.day);
-  const wall = Date.UTC(probe.year, probe.month - 1, probe.day, probe.hour, probe.minute, probe.second);
-  return midnightWall - (wall - (ms + 26 * 3_600_000));
+  const parts = zonedParts(ms, timeZone);
+  return zonedMidnight(parts.year, parts.month, parts.day + 1, timeZone);
 }
 
 /**
@@ -126,7 +135,7 @@ export function splitSample(startRaw: string, endRaw: string | undefined, qty: n
   const endMs = endRaw ? instant(endRaw) : null;
   const offset = timestampOffsetMs(startRaw);
   const endOffset = endRaw ? timestampOffsetMs(endRaw) : null;
-  const stableOffset = offset != null && offset === endOffset ? offset : offset;
+  const stableOffset = offset != null && offset === endOffset ? offset : null;
   if (!(endMs != null && endMs > startMs)) {
     const date = stableOffset != null ? formatOffsetDate(startMs, stableOffset) : formatZonedDate(startMs, timeZone);
     return [{ date, start: startMs, end: startMs, qty }];

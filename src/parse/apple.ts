@@ -1052,6 +1052,16 @@ async function inflateEntry(queue: ByteQueue, method: number, compSize: number, 
   }
 }
 
+async function skipDataDescriptor(queue: ByteQueue, flags: number) {
+  if ((flags & 0x8) === 0) return;
+  const head = await queue.readExact(4);
+  if (u32(head, 0) === 0x08074b50) {
+    await queue.skip(12);
+    return;
+  }
+  await queue.skip(8);
+}
+
 async function readZip(queue: ByteQueue, parser: ReturnType<typeof createAppleExportParser>): Promise<Map<string, string>> {
   const gpx = new Map<string, string>();
   let gpxBytes = 0;
@@ -1088,12 +1098,14 @@ async function readZip(queue: ByteQueue, parser: ReturnType<typeof createAppleEx
     const route = lower.endsWith(".gpx") && gpxBytes + uncompressed <= MAX_GPX_BYTES;
     if (!xml && !route) {
       await queue.skip(compSize);
+      await skipDataDescriptor(queue, flags);
       continue;
     }
     let text = "";
     await inflateEntry(queue, method, compSize, uncompressed, (chunk) => {
       text += chunk;
     });
+    await skipDataDescriptor(queue, flags);
     if (xml) {
       found = true;
       parser.push(text);

@@ -389,6 +389,26 @@ function zipLocal(name: string, method: number, flags: number, data: Uint8Array)
   return bytes;
 }
 
+function dataDescriptor(size: number, signed: boolean): Uint8Array {
+  const bytes = new Uint8Array(signed ? 16 : 12);
+  const view = new DataView(bytes.buffer);
+  const offset = signed ? 4 : 0;
+  if (signed) view.setUint32(0, 0x08074b50, true);
+  view.setUint32(offset + 4, size, true);
+  view.setUint32(offset + 8, size, true);
+  return bytes;
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
 describe("Apple source dedupe", () => {
   it("merges overlapping Watch and iPhone samples instead of summing the day", async () => {
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -431,6 +451,21 @@ describe("Apple source dedupe", () => {
     expect(steps("2026-11-02")?.qty).toBe(140);
     expect(steps("2026-11-03")?.qty).toBe(50);
     expect(steps("2026-11-04")?.qty).toBe(50);
+
+    const late = await parseAppleExport(
+      `<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+  <ExportDate value="2026-11-12 08:00:00 -0500"/>
+  <Record type="HKQuantityTypeIdentifierStepCount" sourceName="Apple Watch" unit="count" value="100" startDate="2026-11-04 04:00:00" endDate="2026-11-04 06:00:00"/>
+  <Record type="HKQuantityTypeIdentifierStepCount" sourceName="Apple Watch" unit="count" value="100" startDate="2026-03-07 23:00:00 -0500" endDate="2026-03-08 04:00:00 -0400"/>
+</HealthData>`,
+      { timeZone: "America/New_York" },
+    );
+    const lateSteps = (date: string) => late.samples.find((sample) => sample.metric === "step_count" && sample.date === date);
+    expect(lateSteps("2026-11-03")?.qty).toBeCloseTo(50, 5);
+    expect(lateSteps("2026-11-04")?.qty).toBeCloseTo(50, 5);
+    expect(lateSteps("2026-03-07")?.qty).toBeCloseTo(25, 5);
+    expect(lateSteps("2026-03-08")?.qty).toBeCloseTo(75, 5);
     expect(steps("2026-11-08")).toMatchObject({ qty: 65, source: WATCH });
 
     expect(parsed.samples.find((sample) => sample.metric === "heart_rate")).toMatchObject({
@@ -511,8 +546,18 @@ describe("Apple source dedupe", () => {
 </HealthData>`);
     const stored = await parseAppleExport(zipLocal("export.xml", 0, 0, xml), { timeZone: "America/Los_Angeles" });
     expect(stored.samples.find((sample) => sample.metric === "step_count")?.qty).toBe(10);
-    const described = await parseAppleExport(zipLocal("export.xml", 0, 0x8, xml), { timeZone: "America/Los_Angeles" });
+    const described = await parseAppleExport(concatBytes([zipLocal("export.xml", 0, 0x8, xml), dataDescriptor(xml.length, true)]), {
+      timeZone: "America/Los_Angeles",
+    });
     expect(described.samples.find((sample) => sample.metric === "step_count")?.qty).toBe(10);
+    const notes = new TextEncoder().encode("notes");
+    const ahead = concatBytes([
+      zipLocal("workout-routes/note.txt", 0, 0x8, notes),
+      dataDescriptor(notes.length, false),
+      zipLocal("export.xml", 0, 0, xml),
+    ]);
+    const afterSkipped = await parseAppleExport(ahead, { timeZone: "America/Los_Angeles" });
+    expect(afterSkipped.samples.find((sample) => sample.metric === "step_count")?.qty).toBe(10);
 
     await expect(parseAppleExport(zipLocal("export.xml", 9, 0, xml))).rejects.toMatchObject({ code: "UNSUPPORTED_ZIP" });
     await expect(parseAppleExport(zipLocal("export.xml", 9, 0, xml))).rejects.toThrow(/ditto -x -k/);
