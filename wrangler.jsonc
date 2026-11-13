@@ -16,7 +16,7 @@
     "required": ["HEALTH_INGEST_TOKEN"]
   },
   "vars": {
-    "HEALTH_TIMEZONE": "America/Los_Angeles",
+    "HEALTH_TIMEZONE": "America/New_York",
     "MCP_ALLOWED_ORIGINS": "",
     "INGEST_MAX_AGE_DAYS": "1",
     "INGEST_MAX_BODY_BYTES": "1000000",
@@ -32,8 +32,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "health-mcp",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_name": "health-mcp-v2",
+      "database_id": "f284c762-5645-4849-bfdf-7bb626d383aa",
       "migrations_dir": "migrations"
     }
   ],
