@@ -3,8 +3,8 @@ import { createMcpHandler } from "agents/mcp/server";
 import { z } from "zod";
 import { isRealIsoDate } from "./dates.js";
 import { isSeriesKey } from "./id.js";
-import { eventsInRange, listMetrics, metricRows, readHint, readSeries, samplesForDay, workoutsForDay, workoutsInRange } from "./storage.js";
-import { rollupMetric, summarizeDay } from "./summary.js";
+import { eventsInRange, listMetrics, metricRollup, readHint, readSeries, samplesForDay, workoutsForDay, workoutsInRange } from "./storage.js";
+import { summarizeDay } from "./summary.js";
 import type { EventKind } from "./types.js";
 
 const MAX_RANGE_DAYS = 366;
@@ -68,8 +68,7 @@ function buildServer(env: Env) {
     async ({ metric, start_date, end_date }) => {
       const error = rangeError(start_date, end_date);
       if (error) return toolResult({ error }, true);
-      const rows = await metricRows(env.DB, metric, start_date, end_date);
-      const rolled = rollupMetric(rows, MAX_ROWS);
+      const rolled = await metricRollup(env.DB, metric, start_date, end_date, MAX_ROWS);
       return toolResult({ metric, kind: rolled.kind, start_date, end_date, truncated: rolled.truncated, rows: rolled.rows });
     },
   );

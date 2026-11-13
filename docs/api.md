@@ -59,7 +59,7 @@ Tools are read-only, validated with Zod, and capped at a 366-day span and 500 ro
 | --- | --- | --- |
 | `get_daily_summary` | `date` | The same object as `GET /summary`. |
 | `list_metrics` | | Stored metric names and registry kind. |
-| `query_metrics` | `metric`, `start_date`, `end_date` | Daily rollup for that kind: sum, latest, or min/avg/max. Heart rate is min/avg/max. Blood pressure is mean systolic and diastolic. Sleep is the day summary. |
+| `query_metrics` | `metric`, `start_date`, `end_date` | Daily rollup for that kind: sum, latest, or min/avg/max. Heart rate is min/avg/max. Blood pressure is mean systolic and diastolic. Sleep is the day summary. Sums, latest values, and min/avg/max are aggregated in D1, so hourly buckets are not dropped after a raw-row cap. `truncated` is set when more than 500 days match. |
 | `query_workouts` | `start_date`, `end_date` | Workout summaries. `series_key` is set when a route or series exists. The series is not inlined. |
 | `query_events` | `kind`, `start_date`, `end_date` | `symptom`, `cycle`, `medication`, `state_of_mind`, `ecg`, or `heart_rate_notification`. ECG voltage is not inlined. |
 | `get_series` | `key`, optional `part`, optional `offset` | One page of an R2 object. Omit `part` to list the arrays in the object. `key` must look like `series/` plus 32 hex characters. |

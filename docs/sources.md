@@ -49,7 +49,7 @@ The mapper reads:
 
 Cumulative quantities keep one source per metric and day. Set `HEALTH_SOURCE_PRIORITY` (or `--source-priority`) to a comma-separated source list. When it is unset, the largest total wins. Latest values, such as weight, keep the newest sample of the chosen source. Heart rate and other min/avg/max metrics become one daily bucket per source, then one source is kept. Sleep segments keep one source for the wake day.
 
-Samples on the export day itself are dropped. That day is still in progress in the file. Health Auto Export fills it afterward.
+Samples on the export day itself are dropped. That day is still in progress in the file. Health Auto Export fills it afterward. If Health Auto Export later stores the same metric on a day the import already filled, summaries and `query_metrics` use the Health Auto Export samples for that day and do not add the Apple total on top.
 
 Chunk posts use the same bearer token. They ignore the recent-day filter and do not draw down the phone's import window. Dates before `INGEST_MIN_DATE` are still dropped.
 

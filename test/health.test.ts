@@ -2,6 +2,7 @@
 import { env, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { parseAppleExport } from "../src/parse/apple.js";
+import { metricRollup } from "../src/storage.js";
 
 const TOKEN = "Bearer test-token";
 const DAY = "2024-02-06";
@@ -118,7 +119,7 @@ beforeEach(async () => {
     testEnv.DB.prepare("DELETE FROM workouts"),
     testEnv.DB.prepare("DELETE FROM events"),
     testEnv.DB.prepare("DELETE FROM ingest_window"),
-    testEnv.DB.prepare("DELETE FROM ingest_quota"),
+    testEnv.DB.prepare("DELETE FROM ingest_receipt"),
     testEnv.DB.prepare("DELETE FROM export_hint"),
   ]);
   const listed = await testEnv.SERIES.list();
@@ -231,6 +232,63 @@ describe("Apple Health import", () => {
     expect(imported.status).toBe(200);
     const summary = await (await authed(`/summary?date=${DAY}`)).json<{ steps: number }>();
     expect(summary.steps).toBe(8000);
+
+    const live = await postJson("/ingest", {
+      data: { metrics: [{ name: "step_count", units: "count", data: [{ qty: 100, date: "2024-02-06 00:00:00 -0800", source: "iPhone" }] }] },
+    });
+    expect(live.status).toBe(200);
+    const replaced = await (await authed(`/summary?date=${DAY}`)).json<{ steps: number }>();
+    expect(replaced.steps).toBe(100);
+    const rolled = await metricRollup(testEnv.DB, "step_count", DAY, DAY, 500);
+    expect(rolled.rows).toEqual([{ date: DAY, qty: 100, units: "count" }]);
+  });
+});
+
+describe("import window", () => {
+  it("does not open the window for an empty post, and a retry does not add bytes twice", async () => {
+    const empty = await postJson("/ingest", { data: { metrics: [] } });
+    expect(empty.status).toBe(200);
+    const windows = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM ingest_window").first<{ n: number }>();
+    expect(windows?.n).toBe(0);
+
+    const body = {
+      data: { metrics: [{ name: "step_count", units: "count", data: [{ qty: 10, date: "2024-02-06 08:00:00 -0800", source: "iPhone" }] }] },
+    };
+    const size = new TextEncoder().encode(JSON.stringify(body)).byteLength;
+    expect((await postJson("/ingest", body)).status).toBe(200);
+    expect((await postJson("/ingest", body)).status).toBe(200);
+    const row = await testEnv.DB.prepare("SELECT bytes FROM ingest_window WHERE id = 1").first<{ bytes: number }>();
+    const posts = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM ingest_receipt").first<{ n: number }>();
+    expect(row?.bytes).toBe(size);
+    expect(posts?.n).toBe(1);
+  });
+});
+
+describe("metric rollup", () => {
+  it("keeps every day of a min, average, and max metric", async () => {
+    const statements = [];
+    for (let day = 1; day <= 3; day += 1) {
+      const date = `2024-03-0${day}`;
+      for (const [hour, qty] of [
+        [0, 60],
+        [1, 80],
+        [2, 70],
+      ] as const) {
+        statements.push(
+          testEnv.DB
+            .prepare(
+              "INSERT INTO samples (id, metric, date, start_ts, source, qty, qty_min, qty_avg, qty_max, units, kind) VALUES (?, 'heart_rate', ?, ?, '', ?, ?, ?, ?, 'count/min', 'min_avg_max')",
+            )
+            .bind(`hr-${date}-${hour}`, date, `${date} 0${hour}:00:00`, qty, qty - 5, qty, qty + 5),
+        );
+      }
+    }
+    await testEnv.DB.batch(statements);
+    const rolled = await metricRollup(testEnv.DB, "heart_rate", "2024-03-01", "2024-03-03", 500);
+    expect(rolled.truncated).toBe(false);
+    expect(rolled.kind).toBe("min_avg_max");
+    expect(rolled.rows).toHaveLength(3);
+    expect(rolled.rows[0]).toMatchObject({ date: "2024-03-01", min: 55, avg: 70, max: 85 });
   });
 });
 

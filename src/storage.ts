@@ -1,4 +1,4 @@
-import { isSeriesKey } from "./id.js";
+import { isSeriesKey, recordId } from "./id.js";
 import {
   activeLimits,
   backfillClosesAt,
@@ -8,6 +8,7 @@ import {
   type Settings,
   type WindowRow,
 } from "./limits.js";
+import { rollupMetric } from "./summary.js";
 import type { EventKind, HealthEvent, MetricKind, Normalized, Sample, Workout } from "./types.js";
 
 const BATCH = 80;
@@ -45,7 +46,7 @@ function windowFrom(record: WindowRecord | null): WindowRow | null {
 
 export async function loadIngestState(db: D1Database, settings: Settings, now: Date): Promise<IngestState> {
   const row = windowFrom(await db.prepare("SELECT opened_at, closed_at, bytes, days, deadline, total_bytes FROM ingest_window WHERE id = 1").first<WindowRecord>());
-  const quota = await db.prepare("SELECT posts FROM ingest_quota WHERE window_start = ?").bind(hourWindowStart(now)).first<{ posts: number }>();
+  const quota = await db.prepare("SELECT COUNT(*) AS posts FROM ingest_receipt WHERE window_start = ?").bind(hourWindowStart(now)).first<{ posts: number }>();
   const hint = await db.prepare("SELECT hint FROM export_hint WHERE id = 1").first<{ hint: string | null }>();
   const active = activeLimits(row, settings, now);
   return {
@@ -153,48 +154,81 @@ export interface SaveOptions {
   state: IngestState;
 }
 
-/** Upsert records and, for Health Auto Export, update the import window and quota. */
-export async function saveIngest(db: D1Database, options: SaveOptions): Promise<IngestState> {
-  const statements: D1PreparedStatement[] = [];
+export type SaveResult = { ok: true; state: IngestState } | { ok: false; reason: "rate_limited" | "over_budget"; state: IngestState };
+
+async function receiptFor(normalized: Normalized, close: boolean): Promise<string> {
+  const ids = [
+    ...normalized.samples.map((row) => `s:${row.id}`),
+    ...normalized.workouts.map((row) => `w:${row.id}`),
+    ...normalized.events.map((row) => `e:${row.id}`),
+  ].sort();
+  if (!ids.length) return close ? "close" : "empty";
+  return recordId(ids);
+}
+
+/**
+ * Record one Health Auto Export post. The receipt insert is the gate for the
+ * hourly cap and the import byte total, so a retry of the same records does
+ * not count again and two first posts cannot both insert the window row.
+ */
+async function claimPost(db: D1Database, options: SaveOptions, receipt: string): Promise<"claimed" | "retry" | "rate_limited" | "over_budget"> {
   const nowIso = options.now.toISOString();
-  if (options.countPost && options.state.rateLimit > 0) {
-    statements.push(
-      db
-        .prepare("INSERT INTO ingest_quota (window_start, posts) VALUES (?, 1) ON CONFLICT(window_start) DO UPDATE SET posts = posts + 1")
-        .bind(hourWindowStart(options.now)),
-    );
+  const windowStart = hourWindowStart(options.now);
+  const openedAt = options.state.row?.opened_at || nowIso;
+  const deadline = options.state.row?.deadline || backfillClosesAt(openedAt, options.settings.backfill.hours);
+  const total = options.state.row?.total_bytes ?? options.settings.backfill.totalBytes;
+  const addBytes = options.charge ? options.bytes : 0;
+  const addDays = options.charge ? distinctDates(options.normalized).length : 0;
+  const closedAt = options.close ? nowIso : null;
+  const rateLimit = options.countPost ? options.state.rateLimit : 0;
+  const chargeFlag = options.charge ? 1 : 0;
+  const claimed = await db
+    .prepare(
+      "INSERT INTO ingest_receipt (id, window_start, bytes) " +
+        "SELECT ?, ?, ? " +
+        "WHERE (? = 0 OR (SELECT COUNT(*) FROM ingest_receipt WHERE window_start = ?) < ?) " +
+        "AND (? = 0 OR COALESCE((SELECT bytes FROM ingest_window WHERE id = 1), 0) + ? <= ?) " +
+        "ON CONFLICT(id) DO NOTHING RETURNING id",
+    )
+    .bind(receipt, windowStart, addBytes, rateLimit, windowStart, rateLimit, chargeFlag, addBytes, total)
+    .first<{ id: string }>();
+  if (claimed?.id) {
+    if (options.charge || options.close) {
+      await db
+        .prepare(
+          "INSERT INTO ingest_window (id, opened_at, closed_at, bytes, days, deadline, total_bytes) VALUES (1, ?, ?, ?, ?, ?, ?) " +
+            "ON CONFLICT(id) DO UPDATE SET bytes = ingest_window.bytes + excluded.bytes, days = ingest_window.days + excluded.days, " +
+            "closed_at = COALESCE(excluded.closed_at, ingest_window.closed_at)",
+        )
+        .bind(openedAt, closedAt, addBytes, addDays, deadline, total)
+        .run();
+    }
+    return "claimed";
   }
-  if (options.charge || options.close) {
-    const openedAt = options.state.row?.opened_at || nowIso;
-    const deadline = options.state.row?.deadline || backfillClosesAt(openedAt, options.settings.backfill.hours);
-    const total = options.state.row?.total_bytes ?? options.settings.backfill.totalBytes;
-    const addBytes = options.charge ? options.bytes : 0;
-    const addDays = options.charge ? distinctDates(options.normalized).length : 0;
-    const closedAt = options.close ? nowIso : options.state.row?.closed_at || null;
-    if (!options.state.row) {
-      statements.push(
-        db
-          .prepare("INSERT INTO ingest_window (id, opened_at, closed_at, bytes, days, deadline, total_bytes) VALUES (1, ?, ?, ?, ?, ?, ?)")
-          .bind(openedAt, closedAt, addBytes, addDays, deadline, total),
-      );
-    } else {
-      statements.push(
-        db
-          .prepare("UPDATE ingest_window SET bytes = bytes + ?, days = days + ?, closed_at = COALESCE(?, closed_at) WHERE id = 1")
-          .bind(addBytes, addDays, options.close ? nowIso : null),
-      );
+  const existing = await db.prepare("SELECT id FROM ingest_receipt WHERE id = ?").bind(receipt).first<{ id: string }>();
+  if (existing) return "retry";
+  const posts = await db.prepare("SELECT COUNT(*) AS posts FROM ingest_receipt WHERE window_start = ?").bind(windowStart).first<{ posts: number }>();
+  if (rateLimit > 0 && Number(posts?.posts || 0) >= rateLimit) return "rate_limited";
+  return "over_budget";
+}
+
+/** Upsert records and, for Health Auto Export, update the import window. */
+export async function saveIngest(db: D1Database, options: SaveOptions): Promise<SaveResult> {
+  if (options.countPost || options.charge || options.close) {
+    const claim = await claimPost(db, options, await receiptFor(options.normalized, options.close));
+    if (claim === "rate_limited" || claim === "over_budget") {
+      return { ok: false, reason: claim, state: await loadIngestState(db, options.settings, options.now) };
     }
   }
+  const statements: D1PreparedStatement[] = [];
   if (options.hint !== undefined) {
-    statements.push(
-      db.prepare("INSERT INTO export_hint (id, hint) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET hint = excluded.hint").bind(options.hint),
-    );
+    statements.push(db.prepare("INSERT INTO export_hint (id, hint) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET hint = excluded.hint").bind(options.hint));
   }
   for (const sample of options.normalized.samples) statements.push(sampleStatement(db, sample));
   for (const workout of options.normalized.workouts) statements.push(workoutStatement(db, workout));
   for (const event of options.normalized.events) statements.push(eventStatement(db, event));
   await runBatches(db, statements);
-  return loadIngestState(db, options.settings, options.now);
+  return { ok: true, state: await loadIngestState(db, options.settings, options.now) };
 }
 
 export interface SampleRow {
@@ -248,14 +282,64 @@ export async function listMetrics(db: D1Database): Promise<{ metric: string; kin
   return result.results;
 }
 
-export async function metricRows(db: D1Database, metric: string, start: string, end: string): Promise<SampleRow[]> {
-  const result = await db
-    .prepare(
-      "SELECT metric, date, start_ts, end_ts, source, qty, qty_min, qty_avg, qty_max, units, label, extra, kind, series_key FROM samples WHERE metric = ? AND date >= ? AND date <= ? ORDER BY date, start_ts LIMIT 5000",
-    )
+const LIVE_SAMPLE =
+  "NOT (IFNULL(json_extract(COALESCE(extra, '{}'), '$.apple'), 0) = 1 AND EXISTS (" +
+  "SELECT 1 FROM samples AS live WHERE live.metric = samples.metric AND live.date = samples.date " +
+  "AND IFNULL(json_extract(live.extra, '$.apple'), 0) != 1))";
+
+export async function metricRollup(db: D1Database, metric: string, start: string, end: string, limit: number) {
+  const where = `metric = ? AND date >= ? AND date <= ? AND ${LIVE_SAMPLE}`;
+  const kindRow = await db.prepare(`SELECT kind FROM samples WHERE ${where} ORDER BY date, start_ts LIMIT 1`).bind(metric, start, end).first<{ kind: MetricKind }>();
+  const count = await db
+    .prepare(`SELECT COUNT(*) AS n FROM (SELECT date FROM samples WHERE ${where} GROUP BY date)`)
     .bind(metric, start, end)
-    .all<SampleRow>();
-  return result.results;
+    .first<{ n: number }>();
+  const days = Number(count?.n || 0);
+  const truncated = days > limit;
+  if (!kindRow) return { kind: "quantity" as const, truncated: false, rows: [] as unknown[] };
+  if (kindRow.kind === "sleep") {
+    const result = await db
+      .prepare(
+        `SELECT metric, date, start_ts, end_ts, source, qty, qty_min, qty_avg, qty_max, units, label, extra, kind, series_key FROM samples WHERE ${where} ORDER BY date, start_ts LIMIT 10001`,
+      )
+      .bind(metric, start, end)
+      .all<SampleRow>();
+    const rolled = rollupMetric(result.results, limit);
+    return { kind: rolled.kind, truncated: truncated || result.results.length > 10_000, rows: rolled.rows };
+  }
+  const capped = Math.min(limit, 500);
+  if (kindRow.kind === "min_avg_max") {
+    const result = await db
+      .prepare(
+        `SELECT date, MIN(COALESCE(qty_min, qty)) AS min, AVG(COALESCE(qty_avg, qty)) AS avg, MAX(COALESCE(qty_max, qty)) AS max, MAX(units) AS units FROM samples WHERE ${where} GROUP BY date ORDER BY date LIMIT ?`,
+      )
+      .bind(metric, start, end, capped)
+      .all<{ date: string; min: number | null; avg: number | null; max: number | null; units: string | null }>();
+    return { kind: kindRow.kind, truncated, rows: result.results };
+  }
+  if (kindRow.kind === "latest") {
+    const result = await db
+      .prepare(
+        `SELECT date, qty, units, start_ts FROM (SELECT date, qty, units, start_ts, ROW_NUMBER() OVER (PARTITION BY date ORDER BY start_ts DESC) AS rn FROM samples WHERE ${where}) ranked WHERE rn = 1 ORDER BY date LIMIT ?`,
+      )
+      .bind(metric, start, end, capped)
+      .all<{ date: string; qty: number | null; units: string | null; start_ts: string }>();
+    return { kind: kindRow.kind, truncated, rows: result.results };
+  }
+  if (kindRow.kind === "blood_pressure") {
+    const result = await db
+      .prepare(
+        `SELECT date, AVG(COALESCE(qty_max, qty)) AS systolic, AVG(qty_min) AS diastolic, MAX(COALESCE(units, 'mmHg')) AS units FROM samples WHERE ${where} GROUP BY date ORDER BY date LIMIT ?`,
+      )
+      .bind(metric, start, end, capped)
+      .all<{ date: string; systolic: number | null; diastolic: number | null; units: string | null }>();
+    return { kind: kindRow.kind, truncated, rows: result.results };
+  }
+  const result = await db
+    .prepare(`SELECT date, SUM(COALESCE(qty, 0)) AS qty, MAX(units) AS units FROM samples WHERE ${where} GROUP BY date ORDER BY date LIMIT ?`)
+    .bind(metric, start, end, capped)
+    .all<{ date: string; qty: number; units: string | null }>();
+  return { kind: kindRow.kind, truncated, rows: result.results };
 }
 
 export async function workoutsInRange(db: D1Database, start: string, end: string, limit: number): Promise<Workout[]> {

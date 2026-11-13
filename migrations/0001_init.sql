@@ -65,10 +65,12 @@ CREATE TABLE ingest_window (
   total_bytes INTEGER
 );
 
-CREATE TABLE ingest_quota (
-  window_start INTEGER PRIMARY KEY,
-  posts INTEGER NOT NULL
+CREATE TABLE ingest_receipt (
+  id TEXT PRIMARY KEY,
+  window_start INTEGER NOT NULL,
+  bytes INTEGER NOT NULL
 );
+CREATE INDEX ingest_receipt_window ON ingest_receipt(window_start);
 
 CREATE TABLE export_hint (
   id INTEGER PRIMARY KEY CHECK (id = 1),

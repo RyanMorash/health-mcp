@@ -38,6 +38,25 @@ export interface DailySummary {
   export_hint?: string;
 }
 
+function appleOwned(extra: string | null): boolean {
+  if (!extra) return false;
+  try {
+    return (JSON.parse(extra) as { apple?: unknown }).apple === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Health Auto Export samples replace an Apple daily total for the same metric and day. */
+export function preferHealthAutoExport(samples: SampleRow[]): SampleRow[] {
+  const live = new Set<string>();
+  for (const sample of samples) {
+    if (!appleOwned(sample.extra)) live.add(`${sample.metric}\0${sample.date}`);
+  }
+  if (!live.size) return samples;
+  return samples.filter((sample) => !appleOwned(sample.extra) || !live.has(`${sample.metric}\0${sample.date}`));
+}
+
 function sleepFrom(samples: SampleRow[]): DailySummary["sleep"] {
   const rows = samples.filter((sample) => sample.metric === "sleep_analysis");
   if (!rows.length) return null;
@@ -79,6 +98,7 @@ function sleepFrom(samples: SampleRow[]): DailySummary["sleep"] {
 
 /** One calendar day in the shape GET /summary and get_daily_summary share. */
 export function summarizeDay(date: string, samples: SampleRow[], workouts: Workout[], hint: string | null): DailySummary {
+  samples = preferHealthAutoExport(samples);
   const out: DailySummary = {
     date,
     dietary_kcal: null,
@@ -125,6 +145,7 @@ export function summarizeDay(date: string, samples: SampleRow[], workouts: Worko
 }
 
 export function rollupMetric(rows: SampleRow[], limit = 500) {
+  rows = preferHealthAutoExport(rows);
   const kind = rows[0]?.kind || "quantity";
   const byDate = new Map<string, SampleRow[]>();
   for (const row of rows) {

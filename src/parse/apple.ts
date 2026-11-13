@@ -848,6 +848,7 @@ async function seal(result: ReturnType<ReturnType<typeof createAppleExportParser
     workout.id = workout.id || (await recordId(["workout", workout.name, workout.start_ts, workout.source]));
     workouts.push(workout);
   }
+  for (const sample of samples) sample.extra = { ...(sample.extra || {}), apple: true };
   return { samples, workouts, events, series: [] };
 }
 

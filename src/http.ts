@@ -34,6 +34,21 @@ function withBackfill(body: Record<string, unknown>, state: IngestState, status:
   return json({ ...body, backfill: backfillBody(state) }, status);
 }
 
+function rejectIngest(reason: "rate_limited" | "over_budget", state: IngestState, now: Date): Response {
+  if (reason === "over_budget") {
+    return withBackfill(
+      { error: "payload_too_large", message: `This chunk would pass the initial import total. ${chunkHint(state.byteLimit)}` },
+      state,
+      413,
+    );
+  }
+  return json(
+    { error: "rate_limited", message: `Too many ingest posts for this token. The limit is ${state.rateLimit} per hour.`, backfill: backfillBody(state) },
+    429,
+    { "retry-after": String(secondsUntilNextHour(now)) },
+  );
+}
+
 async function readLimited(req: Request, limit: number): Promise<Uint8Array> {
   const reader = req.body?.getReader();
   if (!reader) return new Uint8Array();
@@ -126,7 +141,8 @@ async function ingest(req: Request, env: Env, settings: Settings, now: Date): Pr
       settings,
       state,
     });
-    return withBackfill({ ok: true, samples: 0, workouts: 0, events: 0, dates: [] }, saved, 200);
+    if (!saved.ok) return rejectIngest(saved.reason, saved.state, now);
+    return withBackfill({ ok: true, samples: 0, workouts: 0, events: 0, dates: [] }, saved.state, 200);
   }
   const parsed = await parseHealthAutoExport(body, settings.timeZone);
   if (parsed.error) return withBackfill({ error: parsed.error }, state, 400);
@@ -155,6 +171,9 @@ async function ingest(req: Request, env: Env, settings: Settings, now: Date): Pr
       : `${INITIAL_IMPORT_CLOSED} Send today and yesterday.`;
     return withBackfill({ error: "outside_window", message, ...dropCounts(filtered) }, state, 422);
   }
+  if (!kept) {
+    return withBackfill({ ok: true, samples: 0, workouts: 0, events: 0, dates: [], ...dropCounts(filtered) }, state, 200);
+  }
   if (keepPast && bytes.byteLength > state.admitRemaining) {
     return withBackfill(
       { error: "payload_too_large", message: `This chunk would pass the initial import total. ${chunkHint(settings.backfill.maxBytes)}` },
@@ -170,11 +189,10 @@ async function ingest(req: Request, env: Env, settings: Settings, now: Date): Pr
     );
   }
   const hint = filtered.droppedStale >= STALE_HINT_AT ? exportHint(settings.backfill.maxBytes) : kept ? null : undefined;
-  await putSeries(env.SERIES, filtered.normalized);
   const saved = await saveIngest(env.DB, {
     normalized: filtered.normalized,
     bytes: bytes.byteLength,
-    charge: true,
+    charge: keepPast,
     close: wantsClose(req, body),
     countPost: true,
     hint,
@@ -182,6 +200,8 @@ async function ingest(req: Request, env: Env, settings: Settings, now: Date): Pr
     settings,
     state,
   });
+  if (!saved.ok) return rejectIngest(saved.reason, saved.state, now);
+  await putSeries(env.SERIES, filtered.normalized);
   return withBackfill(
     {
       ok: true,
@@ -191,7 +211,7 @@ async function ingest(req: Request, env: Env, settings: Settings, now: Date): Pr
       dates: distinctDates(filtered.normalized),
       ...dropCounts(filtered),
     },
-    saved,
+    saved.state,
     200,
   );
 }
