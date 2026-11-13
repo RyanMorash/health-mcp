@@ -12,6 +12,7 @@ import {
   wordsFromIdentifier,
 } from "../catalog.js";
 import { instant, localDate } from "../dates.js";
+import { effectivePriority, mergeSpans, pickSleepSource, sourceRank, splitSample } from "./dedupe.js";
 import { recordId, seriesKey } from "../id.js";
 import {
   emptyNormalized,
@@ -34,11 +35,14 @@ const MAX_ROUTE_POINTS = 2_000;
 
 export class AppleExportError extends Error {
   code: string;
-  constructor(code: string) {
-    super(code);
+  constructor(code: string, message = code) {
+    super(message);
     this.code = code;
   }
 }
+
+const ZIP_UNZIP_HINT =
+  "This zip is not a plain deflate archive. Unzip it with: ditto -x -k export.zip export-dir — then pass the export.xml file inside it.";
 
 export function parseSourcePriority(value: unknown): string[] {
   if (value == null || value === false) return [];
@@ -135,6 +139,26 @@ interface Bucket {
   units: string | null;
 }
 
+interface Span {
+  metric: string;
+  date: string;
+  source: string;
+  start: number;
+  end: number;
+  qty: number;
+  units: string | null;
+  kind: MetricKind;
+}
+
+interface DayTotal {
+  metric: string;
+  date: string;
+  source: string;
+  kind: MetricKind;
+  qty: number;
+  units: string | null;
+}
+
 interface Segment {
   metric: string;
   date: string;
@@ -170,8 +194,10 @@ export interface AppleParseOptions {
 
 export function createAppleExportParser(options: AppleParseOptions = {}) {
   const timeZone = options.timeZone || "UTC";
-  const priority = parseSourcePriority(options.sourcePriority);
+  const priority = effectivePriority(parseSourcePriority(options.sourcePriority));
   const buckets = new Map<string, Bucket>();
+  const spans: Span[] = [];
+  let spanTick = 1;
   const segments = new Map<string, Segment>();
   const directSamples: Sample[] = [];
   const events: HealthEvent[] = [];
@@ -210,16 +236,30 @@ export function createAppleExportParser(options: AppleParseOptions = {}) {
     }
   }
 
+  function addCumulative(metric: string, source: string, startRaw: string, endRaw: string | undefined, qty: number, units: string | null) {
+    const kind = kindFor(metric);
+    for (const piece of splitSample(startRaw, endRaw, qty, timeZone, spanTick)) {
+      spanTick += 1;
+      if (!keep(piece.date)) continue;
+      spans.push({ metric, date: piece.date, source, start: piece.start, end: piece.end, qty: piece.qty, units, kind });
+    }
+  }
+
   function addQuantity(attrs: Record<string, string>) {
     const metric = hkQuantityMetric(attrs.type);
     const ts = attrs.startDate || attrs.endDate;
     const qty = finite(attrs.value);
     if (!metric || !ts || qty == null) return;
-    const date = localDate(ts, timeZone);
-    if (!date) return;
     const side = hkSide(attrs.type);
     const stored = ENERGY_METRICS.has(metric) ? toKcal(qty, attrs.unit) : qty;
     const units = ENERGY_METRICS.has(metric) ? "kcal" : attrs.unit || null;
+    const kind = kindFor(metric);
+    if (!side && (kind === "sum" || kind === "quantity")) {
+      addCumulative(metric, attrs.sourceName || "", ts, attrs.endDate || ts, stored, units);
+      return;
+    }
+    const date = localDate(ts, timeZone);
+    if (!date) return;
     if (side) {
       if (!keep(date)) return;
       directSamples.push({
@@ -284,12 +324,12 @@ export function createAppleExportParser(options: AppleParseOptions = {}) {
       const left = instant(start);
       const right = end ? instant(end) : null;
       const minutes = left == null || right == null ? 0 : (right - left) / 60_000;
-      addBucket("mindful_minutes", date, source, start, minutes, "min", null);
+      addCumulative("mindful_minutes", source, start, end || start, minutes, "min");
       return;
     }
     if (suffix === "AppleStandHour") {
       const stood = /stood/i.test(attrs.value || "");
-      if (stood) addBucket("apple_stand_hour", date, source, start, 1, "count", null);
+      if (stood) addCumulative("apple_stand_hour", source, start, end || start, 1, "count");
       return;
     }
     if (suffix === "HandwashingEvent" || suffix === "ToothbrushingEvent") {
@@ -718,18 +758,17 @@ export function createAppleExportParser(options: AppleParseOptions = {}) {
     }
   }
 
-  function choose<T extends { source: string; sum?: number; n?: number; lastTs?: string }>(list: T[], latest: boolean): T {
-    for (const name of priority) {
-      const match = list.find((bucket) => bucket.source === name);
-      if (match) return match;
-    }
-    return list.reduce((best, bucket) => {
-      if (!best) return bucket;
-      if (latest) return String(bucket.lastTs) > String(best.lastTs) ? bucket : best;
-      const score = bucket.sum ?? bucket.n ?? 0;
-      const bestScore = best.sum ?? best.n ?? 0;
-      return score > bestScore ? bucket : best;
-    });
+  function chooseBucket(list: Bucket[]): Bucket {
+    return list.slice().sort((a, b) => {
+      if (a.kind === "latest" || b.kind === "latest") {
+        const left = instant(a.lastTs) ?? 0;
+        const right = instant(b.lastTs) ?? 0;
+        if (left !== right) return right - left;
+      }
+      const rank = sourceRank(a.source, priority) - sourceRank(b.source, priority);
+      if (rank !== 0) return rank;
+      return b.n - a.n;
+    })[0];
   }
 
   return {
@@ -737,7 +776,7 @@ export function createAppleExportParser(options: AppleParseOptions = {}) {
       if (text) buf += text;
       pump();
     },
-    finish(): { exportDay: string | null; buckets: Bucket[]; segments: Segment[]; directSamples: Sample[]; events: HealthEvent[]; workouts: Workout[]; activity: Record<string, Sample>[] } {
+    finish(): { exportDay: string | null; buckets: Bucket[]; totals: DayTotal[]; segments: Segment[]; directSamples: Sample[]; events: HealthEvent[]; workouts: Workout[]; activity: Record<string, Sample>[] } {
       pump();
       if (mode !== "text" || skipping || capturing || doctypeState) throw new AppleExportError("INVALID_EXPORT");
       if (!sawExport) throw new AppleExportError("INVALID_EXPORT");
@@ -749,7 +788,20 @@ export function createAppleExportParser(options: AppleParseOptions = {}) {
         else groups.set(key, [bucket]);
       }
       const chosen: Bucket[] = [];
-      for (const list of groups.values()) chosen.push(choose(list, list[0].kind === "latest"));
+      for (const list of groups.values()) chosen.push(chooseBucket(list));
+      const spanGroups = new Map<string, Span[]>();
+      for (const span of spans) {
+        const key = `${span.metric}\0${span.date}`;
+        const list = spanGroups.get(key);
+        if (list) list.push(span);
+        else spanGroups.set(key, [span]);
+      }
+      const totals: DayTotal[] = [];
+      for (const list of spanGroups.values()) {
+        const merged = mergeSpans(list, priority);
+        if (!merged) continue;
+        totals.push({ metric: list[0].metric, date: list[0].date, kind: list[0].kind, ...merged });
+      }
       const sleepGroups = new Map<string, Segment[]>();
       for (const segment of segments.values()) {
         const list = sleepGroups.get(segment.date);
@@ -758,19 +810,13 @@ export function createAppleExportParser(options: AppleParseOptions = {}) {
       }
       const keptSegments: Segment[] = [];
       for (const list of sleepGroups.values()) {
-        const sources = [...new Set(list.map((segment) => segment.source))];
-        const picked = choose(
-          sources.map((source) => ({
-            source,
-            n: list.filter((segment) => segment.source === source).length,
-          })),
-          false,
-        ).source;
+        const picked = pickSleepSource(list, priority);
         keptSegments.push(...list.filter((segment) => segment.source === picked));
       }
       return {
         exportDay,
         buckets: chosen,
+        totals,
         segments: keptSegments,
         directSamples,
         events,
@@ -785,7 +831,7 @@ async function sampleFromBucket(bucket: Bucket): Promise<Sample> {
   const kind = bucket.side ? "blood_pressure" : bucket.kind;
   const qty = kind === "latest" ? bucket.lastQty : kind === "min_avg_max" ? (bucket.n ? bucket.sum / bucket.n : null) : bucket.sum;
   return {
-    id: await recordId(["day", bucket.metric, bucket.date, bucket.source, bucket.side || ""]),
+    id: await recordId(["day", bucket.metric, bucket.date, bucket.side || bucket.kind]),
     metric: bucket.metric,
     date: bucket.date,
     start_ts: kind === "latest" ? bucket.lastTs : `${bucket.date} 00:00:00`,
@@ -803,9 +849,33 @@ async function sampleFromBucket(bucket: Bucket): Promise<Sample> {
   };
 }
 
+async function sampleFromTotal(total: DayTotal): Promise<Sample> {
+  return {
+    id: await recordId(["day", total.metric, total.date]),
+    metric: total.metric,
+    date: total.date,
+    start_ts: `${total.date} 00:00:00`,
+    end_ts: null,
+    source: total.source,
+    qty: total.qty,
+    qty_min: null,
+    qty_avg: null,
+    qty_max: null,
+    units: total.units,
+    label: null,
+    extra: null,
+    kind: total.kind,
+    series_key: null,
+  };
+}
+
 async function seal(result: ReturnType<ReturnType<typeof createAppleExportParser>["finish"]>): Promise<Normalized> {
-  const present = new Set(result.buckets.map((bucket) => `${bucket.metric}\0${bucket.date}`));
+  const present = new Set([
+    ...result.buckets.map((bucket) => `${bucket.metric}\0${bucket.date}`),
+    ...result.totals.map((total) => `${total.metric}\0${total.date}`),
+  ]);
   const samples: Sample[] = [];
+  for (const total of result.totals) samples.push(await sampleFromTotal(total));
   for (const bucket of result.buckets) samples.push(await sampleFromBucket(bucket));
   for (const rows of result.activity) {
     for (const sample of Object.values(rows)) {
@@ -1005,9 +1075,12 @@ async function readZip(queue: ByteQueue, parser: ReturnType<typeof createAppleEx
     const uncompressed = u32(header, 18);
     const nameLen = u16(header, 22);
     const extraLen = u16(header, 24);
-    if (flags & 0x1 || flags & 0x8) throw new AppleExportError("UNSUPPORTED_ZIP");
-    if (compSize === 0xffffffff || uncompressed === 0xffffffff) throw new AppleExportError("UNSUPPORTED_ZIP");
-    if (method !== 0 && method !== 8) throw new AppleExportError("UNSUPPORTED_ZIP");
+    if (flags & 0x1) throw new AppleExportError("UNSUPPORTED_ZIP", `${ZIP_UNZIP_HINT} The entry is encrypted.`);
+    if (method !== 0 && method !== 8) throw new AppleExportError("UNSUPPORTED_ZIP", `${ZIP_UNZIP_HINT} Compression method ${method} is not supported.`);
+    if (compSize === 0xffffffff || uncompressed === 0xffffffff) throw new AppleExportError("UNSUPPORTED_ZIP", `${ZIP_UNZIP_HINT} The entry uses zip64 sizes.`);
+    if ((flags & 0x8) && (compSize === 0 || uncompressed === 0)) {
+      throw new AppleExportError("UNSUPPORTED_ZIP", `${ZIP_UNZIP_HINT} The entry stores its size in a data descriptor.`);
+    }
     const name = new TextDecoder().decode(await queue.readExact(nameLen)).replaceAll("\\", "/");
     await queue.skip(extraLen);
     const lower = name.toLowerCase();

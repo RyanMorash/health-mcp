@@ -350,6 +350,7 @@ async function importChunk(req: Request, env: Env, settings: Settings, now: Date
     now,
     settings,
     state,
+    replaceAppleDates: distinctDates(filtered.normalized),
   });
   return json({
     ok: true,

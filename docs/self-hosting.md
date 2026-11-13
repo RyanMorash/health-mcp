@@ -67,7 +67,13 @@ npm run import:apple -- /path/to/export.zip \
 
 Set `HEALTH_INGEST_TOKEN` in the environment yourself. The command does not read it from Wrangler. Prefer the environment variable to `--token`, which shows up in the process list.
 
-The importer streams the zip or `export.xml`. It refuses a zip that looks like a bomb (excessive compression, zip64, encrypted entries, or a huge uncompressed size). If one date batch is still over about 4.5 MB, it splits that batch further.
+The importer streams the zip or `export.xml`. It refuses a zip that looks like a bomb (excessive compression, zip64, encrypted entries, or a huge uncompressed size). iPhone exports are sometimes Deflate64 or use a data descriptor. The importer then tells you to unzip with `ditto -x -k export.zip export-dir` and pass `export.xml`. If one date batch is still over about 4.5 MB, it splits that batch further.
+
+A second import replaces Apple-import samples for each date it sends. Health Auto Export rows are left alone. Rows from a previous import whose ids included the source name are removed for those dates, so `query_metrics` cannot add them to the new total. Dates the new file does not contain are untouched. To clear every Apple-import sample first:
+
+```bash
+npx wrangler d1 execute health-mcp --remote --command "DELETE FROM samples WHERE json_extract(COALESCE(extra, '{}'), '$.apple') = 1"
+```
 
 ## Free plan
 

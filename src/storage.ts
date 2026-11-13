@@ -152,6 +152,8 @@ export interface SaveOptions {
   now: Date;
   settings: Settings;
   state: IngestState;
+  /** Dates whose previous Apple-import samples should be removed before insert. */
+  replaceAppleDates?: string[];
 }
 
 export type SaveResult = { ok: true; state: IngestState } | { ok: false; reason: "rate_limited" | "over_budget"; state: IngestState };
@@ -222,6 +224,11 @@ export async function saveIngest(db: D1Database, options: SaveOptions): Promise<
     }
   }
   const statements: D1PreparedStatement[] = [];
+  for (const date of options.replaceAppleDates || []) {
+    statements.push(
+      db.prepare("DELETE FROM samples WHERE date = ? AND json_extract(COALESCE(extra, '{}'), '$.apple') = 1").bind(date),
+    );
+  }
   if (options.hint !== undefined) {
     statements.push(db.prepare("INSERT INTO export_hint (id, hint) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET hint = excluded.hint").bind(options.hint));
   }

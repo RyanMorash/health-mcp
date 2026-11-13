@@ -41,6 +41,8 @@ Normalized records from `npm run import:apple`. The body is:
 
 This route does not open or close the import window, does not count against the hourly ingest limit, and does not apply the recent-day filter. It still drops dates before `INGEST_MIN_DATE` and dates more than a day ahead. The body cap is `INGEST_BACKFILL_MAX_BYTES` (default 5 MB, maximum 10 MB). More than 366 dates or 20,000 rows is `413`.
 
+Sending a date again deletes Apple-import samples for that date (`extra.apple`) and then inserts the chunk. Health Auto Export rows on the same date are not deleted. Summaries still prefer those rows over the Apple import.
+
 ## `GET /summary?date=YYYY-MM-DD`
 
 One day: `dietary_kcal`, `protein_g`, `carbs_g`, `fat_g`, `active_kcal`, `basal_kcal`, `steps`, `weight`, `body_fat_pct`, `sleep`, and `workouts`. Sleep hours come from stage segments when those exist, otherwise from the night summary. Workout entries are name, start, duration in minutes, and active kcal. Routes are not included. `export_hint` is present when a recent ingest dropped a large number of stale days.

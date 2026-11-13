@@ -46,7 +46,7 @@ npm run import:apple -- ~/Downloads/export.zip \
   --source-priority "Apple Watch,iPhone"
 ```
 
-The command streams the export, picks one source per cumulative metric-day, and posts normalized batches. Chunk imports do not use the phone's initial-import window.
+The command streams the export and posts normalized batches. Cumulative days merge Watch and iPhone by time instead of keeping one source for the whole day. Source names match by device class, so `Ryan’s Apple Watch` matches `Apple Watch`. Chunk imports do not use the phone's initial-import window. Posting a date again replaces the Apple-import rows for that date and leaves Health Auto Export rows in place.
 
 ## MCP
 
