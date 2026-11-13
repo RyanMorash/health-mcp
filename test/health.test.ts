@@ -565,5 +565,129 @@ describe("Apple source dedupe", () => {
     new DataView(zeroSized.buffer).setUint32(18, 0, true);
     new DataView(zeroSized.buffer).setUint32(22, 0, true);
     await expect(parseAppleExport(zeroSized)).rejects.toBeInstanceOf(AppleExportError);
+
+    await expect(parseAppleExport(zipLocal("export.xml", 0, 0x1, xml))).rejects.toThrow(/encrypted/);
+    const zip64 = zipLocal("export.xml", 0, 0, xml);
+    const zip64View = new DataView(zip64.buffer);
+    zip64View.setUint32(18, 0xffffffff, true);
+    zip64View.setUint32(22, 0xffffffff, true);
+    await expect(parseAppleExport(zip64)).rejects.toThrow(/zip64/);
+  });
+
+  it("counts only the minutes a lower-priority source does not already cover", async () => {
+    const phone = "Ryan's iPhone";
+    const phonePro = "Ryan\u2019s iPhone 13 Pro";
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+  <ExportDate value="2026-11-12 08:00:00 -0500"/>
+  ${step(WATCH, 100, "2026-11-09", "10:00:00", "11:00:00")}
+  ${step(WATCH, 100, "2026-11-09", "13:00:00", "14:00:00")}
+  ${step(PHONE, 400, "2026-11-09", "10:00:00", "14:00:00")}
+  ${step(WATCH, 100, "2026-11-05", "11:00:00", "12:00:00")}
+  ${step(PHONE, 300, "2026-11-05", "10:00:00", "13:00:00")}
+  ${step(phone, 100, "2026-11-02", "10:00:00", "12:00:00")}
+  ${step(phonePro, 100, "2026-11-02", "11:00:00", "13:00:00")}
+  ${step(WATCH, 1000, "2026-11-01", "10:00:00", "12:00:00")}
+  ${step(PHONE, 25, "2026-11-01", "09:00:00", "09:00:00")}
+  ${step(PHONE, 500, "2026-11-01", "11:00:00", "11:00:00")}
+  ${step(PHONE, 40, "2026-11-01", "12:00:00", "12:00:00")}
+</HealthData>`;
+    const parsed = await parseAppleExport(xml, { timeZone: "America/New_York", sourcePriority: "Apple Watch,iPhone" });
+    const steps = (date: string) => parsed.samples.find((sample) => sample.metric === "step_count" && sample.date === date);
+
+    expect(steps("2026-11-09")?.qty).toBe(400);
+    expect(steps("2026-11-05")?.qty).toBe(300);
+    expect(steps("2026-11-02")).toMatchObject({ qty: 150, source: phone });
+    expect(steps("2026-11-01")).toMatchObject({ qty: 1065, source: WATCH });
+  });
+
+  it("keeps sleep from the highest-priority source that actually has asleep stages", async () => {
+    function sleep(source: string, value: string, start: string, end: string): string {
+      return `<Record type="HKCategoryTypeIdentifierSleepAnalysis" sourceName="${source}" value="${value}" startDate="${start}" endDate="${end}"/>`;
+    }
+    const header = `<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+  <ExportDate value="2026-11-12 08:00:00 -0500"/>`;
+
+    const phoneAsleep = await parseAppleExport(
+      `${header}
+  ${sleep(WATCH, "HKCategoryValueSleepAnalysisInBed", "2026-11-09 22:00:00 -0500", "2026-11-10 09:00:00 -0500")}
+  ${sleep(PHONE, "HKCategoryValueSleepAnalysisAsleepCore", "2026-11-10 01:00:00 -0500", "2026-11-10 02:00:00 -0500")}
+  ${sleep("Clock", "HKCategoryValueSleepAnalysisInBed", "2026-11-09 22:00:00 -0500", "2026-11-10 09:00:00 -0500")}
+</HealthData>`,
+      { timeZone: "America/New_York", sourcePriority: "Apple Watch,iPhone" },
+    );
+    const phoneSleep = phoneAsleep.samples.filter((sample) => sample.metric === "sleep_analysis");
+    expect(phoneSleep).toHaveLength(1);
+    expect(phoneSleep[0]).toMatchObject({ source: PHONE, label: "Core", date: "2026-11-10" });
+
+    const clockPenalty = await parseAppleExport(
+      `${header}
+  ${sleep(WATCH, "HKCategoryValueSleepAnalysisAsleepCore", "2026-11-11 01:00:00 -0500", "2026-11-11 02:00:00 -0500")}
+  ${sleep("Clock", "HKCategoryValueSleepAnalysisAsleepCore", "2026-11-11 02:00:00 -0500", "2026-11-11 07:00:00 -0500")}
+</HealthData>`,
+      { timeZone: "America/New_York", sourcePriority: "iPhone" },
+    );
+    expect(clockPenalty.samples.filter((sample) => sample.metric === "sleep_analysis")).toEqual([
+      expect.objectContaining({ source: WATCH, label: "Core", qty: 1 }),
+    ]);
+
+    const clockListed = await parseAppleExport(
+      `${header}
+  ${sleep("Clock", "HKCategoryValueSleepAnalysisAsleepCore", "2026-11-11 01:00:00 -0500", "2026-11-11 02:00:00 -0500")}
+  ${sleep(WATCH, "HKCategoryValueSleepAnalysisAsleepCore", "2026-11-11 02:00:00 -0500", "2026-11-11 07:00:00 -0500")}
+</HealthData>`,
+      { timeZone: "America/New_York", sourcePriority: "Clock" },
+    );
+    expect(clockListed.samples.filter((sample) => sample.metric === "sleep_analysis")).toEqual([
+      expect.objectContaining({ source: "Clock", label: "Core", qty: 1 }),
+    ]);
+  });
+
+  it("breaks a same-time weight tie with source priority", async () => {
+    const parsed = await parseAppleExport(
+      `<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+  <ExportDate value="2026-11-12 08:00:00 -0500"/>
+  <Record type="HKQuantityTypeIdentifierBodyMass" sourceName="Withings" unit="kg" value="72" startDate="2026-11-07 08:00:00 -0500" endDate="2026-11-07 08:00:00 -0500"/>
+  <Record type="HKQuantityTypeIdentifierBodyMass" sourceName="${WATCH}" unit="kg" value="80" startDate="2026-11-07 08:00:00 -0500" endDate="2026-11-07 08:00:00 -0500"/>
+</HealthData>`,
+      { timeZone: "America/New_York", sourcePriority: "Apple Watch,iPhone" },
+    );
+    expect(parsed.samples.find((sample) => sample.metric === "weight_body_mass")).toMatchObject({ qty: 80, source: WATCH });
+  });
+
+  it("leaves a Health Auto Export row in place when an Apple chunk replaces that date", async () => {
+    const day = "2026-11-04";
+    await testEnv.DB.batch([
+      testEnv.DB
+        .prepare(
+          "INSERT INTO samples (id, metric, date, start_ts, source, qty, units, kind) VALUES ('hae-steps', 'step_count', ?, ?, 'iPhone', 50, 'count', 'sum')",
+        )
+        .bind(day, `${day} 12:00:00`),
+      testEnv.DB
+        .prepare(
+          "INSERT INTO samples (id, metric, date, start_ts, source, qty, units, kind, extra) VALUES ('legacy-apple', 'step_count', ?, ?, ?, 999, 'count', 'sum', '{\"apple\":true}')",
+        )
+        .bind(day, `${day} 00:00:00`, WATCH),
+    ]);
+    const parsed = await parseAppleExport(
+      `<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+  <ExportDate value="2026-11-12 08:00:00 -0500"/>
+  ${step(WATCH, 10, day, "08:00:00", "09:00:00")}
+</HealthData>`,
+      { timeZone: "America/New_York", sourcePriority: "Apple Watch,iPhone" },
+    );
+    expect((await postJson("/import/apple-health/chunk", parsed)).status).toBe(200);
+    const hae = await testEnv.DB.prepare("SELECT qty, extra FROM samples WHERE id = 'hae-steps'").first<{ qty: number; extra: string | null }>();
+    expect(hae).toMatchObject({ qty: 50, extra: null });
+    const legacy = await testEnv.DB.prepare("SELECT id FROM samples WHERE id = 'legacy-apple'").first();
+    expect(legacy).toBeNull();
+    const apple = await testEnv.DB
+      .prepare("SELECT qty FROM samples WHERE metric = 'step_count' AND date = ? AND json_extract(COALESCE(extra, '{}'), '$.apple') = 1")
+      .bind(day)
+      .all<{ qty: number }>();
+    expect(apple.results).toEqual([{ qty: 10 }]);
   });
 });
