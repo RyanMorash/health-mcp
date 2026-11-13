@@ -1,0 +1,46 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "health-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": true
+    }
+  },
+  "secrets": {
+    "required": ["HEALTH_INGEST_TOKEN"]
+  },
+  "vars": {
+    "HEALTH_TIMEZONE": "America/Los_Angeles",
+    "MCP_ALLOWED_ORIGINS": "",
+    "INGEST_MAX_AGE_DAYS": "1",
+    "INGEST_MAX_BODY_BYTES": "1000000",
+    "INGEST_RATE_LIMIT_PER_HOUR": "6",
+    "INGEST_BACKFILL_HOURS": "72",
+    "INGEST_BACKFILL_MAX_BYTES": "5000000",
+    "INGEST_BACKFILL_MAX_PER_HOUR": "60",
+    "INGEST_BACKFILL_MAX_TOTAL_BYTES": "500000000",
+    "INGEST_MIN_DATE": "2000-01-01"
+    // "MCP_ALLOWED_ORIGINS": "https://claude.ai"
+    // "HEALTH_SOURCE_PRIORITY" is read by the local Apple importer, not by this Worker.
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "health-mcp",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "SERIES",
+      "bucket_name": "health-mcp-series"
+    }
+  ]
+}

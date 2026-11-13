@@ -1,147 +1,76 @@
 # Self-hosting
 
-Deploy options, configuration, migrations, development, and code layout. Security details are in [security.md](security.md).
+health-mcp runs only as a Cloudflare Worker. You need a Cloudflare account, a new D1 database, and an R2 bucket.
 
-## Deploy
+Version 0.1 used Node, Docker, SQLite, Postgres, and a different D1 schema (`points_daily`). Those hosts are gone. Do not apply `migrations/0001_init.sql` to a database that already ran the 0.1 migrations. Create a new database and import again. The old daily rows cannot be rebuilt into samples, workouts, and events, and Android rows are out of scope.
 
-### Cloudflare
-
-Requires Node.js 22 or newer.
+## Create the resources
 
 ```bash
-npm install
-cp wrangler.example.toml wrangler.toml
 npx wrangler login
 npx wrangler d1 create health-mcp
+npx wrangler r2 bucket create health-mcp-series
 ```
 
-Paste the printed database id into `database_id` in `wrangler.toml`. Apply migrations, including `0002_daily_points.sql`, `0003_ingest_guards.sql`, `0004_ingest_backfill.sql`, `0005_quota_window_bigint.sql`, and `0006_ingest_backfill_deadline.sql`, **before** `wrangler deploy`. The worker reads `points_daily`, so deploying first makes ingest fail.
+Copy the printed database id into `database_id` in [`wrangler.jsonc`](../wrangler.jsonc). The committed id is a placeholder so local tests can boot without an account.
+
+Set `HEALTH_TIMEZONE` in `vars` to an IANA zone, for example `America/Los_Angeles`. Sleep nights and the "today and yesterday" window use that zone. A timestamp that already has a numeric offset uses the offset.
 
 ```bash
-node src/cli/d1-migrate.js --remote
-printf '%s' 'replace-with-a-long-random-token' | npx wrangler secret put HEALTH_INGEST_TOKEN
-npx wrangler deploy
+npx wrangler secret put HEALTH_INGEST_TOKEN
+npm run db:migrate
+npm run deploy
 ```
 
-`node src/cli/d1-migrate.js` requires `--remote` or `--local`. It runs every pending file in order: `0001_init.sql`, `0002_daily_points.sql`, `0003_ingest_guards.sql`, `0004_ingest_backfill.sql`, `0005_quota_window_bigint.sql`, then `0006_ingest_backfill_deadline.sql`. Each file is one execute, together with the rows that record it, so the file is applied completely or not at all. It skips an `ADD COLUMN` whose name is already on the table, and it records each file in both migration tables. Run the same command again if it stops: a quota table that was copied and not renamed is finished on the next run. Do not deploy until all six have been applied. `0006` adds the stored deadline and total, and it inserts a closed import-window row when points, workouts, or raw payloads are already stored. A missing row is not an open window.
+`npm run db:migrate` runs `wrangler d1 migrations apply health-mcp --remote`.
 
-For local development, apply the same migrations before `wrangler dev`:
+For local development, copy `.dev.vars.example` to `.dev.vars` and set the token, then `npm run dev`.
+
+## Bindings
+
+| Binding | Kind | Use |
+| --- | --- | --- |
+| `DB` | D1 | Samples, workouts, events, and the import window. Accessed only through `env.DB`. |
+| `SERIES` | R2 | Content-addressed JSON for routes, workout series, ECG voltage, and beat-to-beat readings. |
+
+`db.batch()` counts as one subrequest. Workers Logs and traces are enabled in `wrangler.jsonc`.
+
+`workers_dev` is `true`, so deploy publishes a public `workers.dev` hostname. Anyone who learns that hostname and the token can call the API. Set `workers_dev` to `false` and attach your own route when you do not want the `workers.dev` name.
+
+## Vars
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `HEALTH_TIMEZONE` | `America/Los_Angeles` | Calendar zone when a timestamp has no offset. |
+| `MCP_ALLOWED_ORIGINS` | empty | Comma-separated origins allowed to call `/mcp`. Empty rejects any request that sends `Origin`. |
+| `INGEST_MAX_AGE_DAYS` | `1` | Days before today that a steady-state ingest may include. |
+| `INGEST_MAX_BODY_BYTES` | `1000000` | Steady-state body cap. |
+| `INGEST_RATE_LIMIT_PER_HOUR` | `6` | Steady-state posts per hour. `0` turns it off. |
+| `INGEST_BACKFILL_HOURS` | `72` | How long the initial import stays open. |
+| `INGEST_BACKFILL_MAX_BYTES` | `5000000` | Per-request cap during the import, and the cap for Apple chunks. Hard maximum 10 MB. |
+| `INGEST_BACKFILL_MAX_PER_HOUR` | `60` | Posts per hour while the import is open. |
+| `INGEST_BACKFILL_MAX_TOTAL_BYTES` | `500000000` | Total bytes accepted before the window must be closed. |
+| `INGEST_MIN_DATE` | `2000-01-01` | Earlier dates are dropped on both ingest paths. |
+
+Changing a var requires another deploy. The token is a secret, not a var.
+
+`HEALTH_SOURCE_PRIORITY` is read by the local Apple importer (`Apple Watch,iPhone`). The Worker does not use it. Health Auto Export rows are stored as the app sent them, because that app is where you choose sources.
+
+## Apple import
 
 ```bash
-cp dev.vars.example .dev.vars
-node src/cli/d1-migrate.js --local
-npx wrangler dev
+export HEALTH_INGEST_TOKEN='the token you set with wrangler secret put'
+npm run import:apple -- /path/to/export.zip \
+  --chunk-url https://<worker>/import/apple-health/chunk \
+  --time-zone America/Los_Angeles
 ```
 
-To serve a hostname of your own, uncomment `[[routes]]` in the local `wrangler.toml` and set `pattern`. The Workers preview URL works without a custom domain. `workers_dev = true` exposes a public `workers.dev` URL; see [Security](security.md).
+Set `HEALTH_INGEST_TOKEN` in the environment yourself. The command does not read it from Wrangler. Prefer the environment variable to `--token`, which shows up in the process list.
 
-If you previously ran a build that assumed Pacific Time for offset-less timestamps, set `HEALTH_TIMEZONE` to `America/Los_Angeles`. Health Auto Export's own timestamps include an offset, and those dates do not use this variable.
+The importer streams the zip or `export.xml`. It refuses a zip that looks like a bomb (excessive compression, zip64, encrypted entries, or a huge uncompressed size). If one date batch is still over about 4.5 MB, it splits that batch further.
 
-The Cloudflare deploy stays on the free tier. Plan: free tier; upgrade when a real limit is hit. A D1 daily-limit error is returned as 429 with `Retry-After` until the next 00:00 UTC. See [API reference](api.md).
+## Free plan
 
-### Docker
+D1's free daily row limits fail the write. The Worker answers `429` with `error: daily_limit` and `retry-after` until the next UTC midnight. Wait and send the same body again. Upserts make the retry safe.
 
-```bash
-docker build -t health-mcp .
-docker run --rm -p 8787:8787 \
-  -e HEALTH_INGEST_TOKEN=replace-with-a-long-random-token \
-  -e HEALTH_TIMEZONE=UTC \
-  -v health-mcp:/data \
-  health-mcp
-```
-
-Postgres instead of the SQLite volume:
-
-```bash
-docker run --rm -p 8787:8787 \
-  -e HEALTH_INGEST_TOKEN=replace-with-a-long-random-token \
-  -e DATABASE_URL='postgres://user:password@host:5432/health' \
-  health-mcp
-```
-
-The container listens on `8787` and applies pending migrations on startup. Generate a token with `openssl rand -hex 32`.
-
-### Node
-
-```bash
-npm install
-export HEALTH_INGEST_TOKEN="$(openssl rand -hex 32)"
-export HEALTH_TIMEZONE=UTC
-npm start
-```
-
-`npm start` runs `node src/adapters/node.js`, creates the SQLite directory if needed, and applies any migration that has not been recorded in `schema_migrations`. Set `DATABASE_URL` to a `postgres://` URL to use Postgres instead. The same migrations run there. `mysql://` and other schemes are rejected.
-
-Import an export from Apple Health into that database with `node src/cli/import-apple-health.js export.zip`. To send it to a running server instead, pass `--chunk-url http://127.0.0.1:8787/import/apple-health/chunk`. Set `HEALTH_INGEST_TOKEN` in the environment rather than passing `--token`.
-
-`0002_daily_points.sql` copies existing per-sample `points` rows into `points_daily` (one row per metric and day) and leaves the old table in place. Dropping it would count as a write for every old sample, so do that later with `DROP TABLE points;` once the daily write budget has room. On Cloudflare, apply `0002` with `node src/cli/d1-migrate.js --remote` before `wrangler deploy`, as in the steps above. Node and Docker apply it on startup, before the server accepts traffic.
-
-## Configuration
-
-| Variable | Required | Where | Purpose |
-| --- | --- | --- | --- |
-| `HEALTH_INGEST_TOKEN` | yes | Worker secret, or the process environment | Bearer token for every route. Empty means every bearer request is rejected. |
-| `HEALTH_INGEST_URL_TOKEN` | no | Worker secret, or the process environment | Write-only token for `POST /ingest/hc-webhook`, `POST /ingest/life-dashboard`, and `POST /ingest/shortcuts` when the app cannot send `Authorization`. Must match `^[A-Za-z0-9_-]{32,}$`. Unset, too short, or equal to `HEALTH_INGEST_TOKEN` disables URL-token auth. It does not authenticate `/summary`, `/mcp`, or any other route. |
-| `HEALTH_TIMEZONE` | no | Wrangler `[vars]`, or the process environment | IANA zone used when a timestamp has no numeric offset. Default `UTC` when unset. [`wrangler.example.toml`](../wrangler.example.toml) sets `America/Los_Angeles`. |
-| `DB` | yes on Cloudflare | Wrangler D1 binding | Must be named `DB`. |
-| `DATABASE_URL` | no | Node | `postgres://` or `postgresql://` URL, otherwise a SQLite file path. |
-| `SQLITE_PATH` | no | Node | SQLite file when `DATABASE_URL` is unset. Default `./data/health.sqlite`. The image sets `/data/health.sqlite`. |
-| `PORT` | no | Node | Default `8787`. |
-| `HOST` | no | Node | Default `0.0.0.0`. |
-| `HEALTH_STORE_RAW` | no | Wrangler `[vars]`, or the process environment | Store each request body in `raw_payloads`. Default off. Set `true`, `1`, `yes`, or `on` to store it. `false`, `0`, `no`, and `off` leave it off. Bodies over about 1.5MB are skipped either way, under D1's 2MB row limit. |
-| `HEALTH_METRIC_ALLOWLIST` | no | Wrangler `[vars]`, or the process environment | Comma-separated metric names to store in addition to the summary set. |
-| `HEALTH_SHORTCUTS_SOURCE_PRIORITY` | no | Wrangler `[vars]`, or the process environment | Raw-sample mode of `POST /ingest/shortcuts` only. Comma-separated, case-insensitive fragments of source names; the first fragment found in a source name wins that metric-day. Default `watch,iphone`. See [shortcuts.md](shortcuts.md). |
-| `HEALTH_SOURCE_PRIORITY` | no | Wrangler `[vars]`, or the process environment | Comma-separated `sourceName` values from an export of Apple Health. When an export has several sources for one metric-day, the first listed source that has samples wins. Unset, summed metrics keep the largest total, and weight and body fat keep the newest reading. |
-| `MCP_ALLOWED_ORIGINS` | no | Wrangler `[vars]`, or the process environment | Comma-separated `Origin` values allowed to call `/mcp`. Empty by default, which rejects every request that sends `Origin`. Requests with no `Origin` header stay allowed. |
-| `INGEST_MAX_AGE_DAYS` | no | Wrangler `[vars]`, or the process environment | How many days before today Health Auto Export JSON on `POST /ingest` may include. Default `1` (today and yesterday in `HEALTH_TIMEZONE`). Values above 36500 are clamped to 36500. Older points are dropped and counted as `dropped_stale`. Dates more than one day after today are counted as `dropped_future`. `POST /import/apple-health` ignores this. |
-| `INGEST_MAX_BODY_BYTES` | no | Wrangler `[vars]`, or the process environment | Maximum JSON ingest body in bytes. Default `1000000`. A larger body returns `413` with `payload_too_large`. Capped at 20,000,000. |
-| `INGEST_RATE_LIMIT_PER_HOUR` | no | Wrangler `[vars]`, or the process environment | Accepted ingest posts per token per UTC hour. Default `6`. `0` disables the limit. Over the limit returns `429` with `Retry-After`. |
-| `INGEST_MIN_DATE` | no | Wrangler `[vars]`, or the process environment | Earliest calendar date an import may store. Default `2000-01-01`. A real date is clamped to `1970-01-01` through today in UTC. A value that is not a real calendar day uses the default. |
-| `INGEST_BACKFILL_HOURS` | no | Wrangler `[vars]`, or the process environment | How long the initial import window stays open after the first accepted ingest. Default `72`. Values below 1 use the default. Values above 8784 are clamped to 8784. The deadline is stored on the row when the window opens. |
-| `INGEST_BACKFILL_MAX_BYTES` | no | Wrangler `[vars]`, or the process environment | Per-request JSON body cap while the initial import window is open. Default `5000000`. Clamped to 10000000. The hint text uses this cap. The default wording is 5 MB. A `content-type` that does not contain `json` keeps the 20,000,000 byte cap. |
-| `INGEST_BACKFILL_MAX_PER_HOUR` | no | Wrangler `[vars]`, or the process environment | Accepted ingest posts per token per UTC hour while the initial import window is open. Default `60`. Clamped to 10000. |
-| `INGEST_BACKFILL_MAX_TOTAL_BYTES` | no | Wrangler `[vars]`, or the process environment | Total accepted body bytes for the whole initial import window. Default `500000000`. Clamped to 5000000000. The value is stored on the row when the window opens. Apple Health imports do not count toward this total. |
-| `INGEST_MAX_STATEMENTS` | no | Wrangler `[vars]`, or the process environment | On D1, the most statements one ingest request may run, counted before any write. Default `45`. A larger value cannot raise that ceiling. Over the budget, D1 returns `413`. An Apple Health import names `node src/cli/import-apple-health.js --chunk-url`. A Health Auto Export request names `POST /import/apple-health/chunk`. SQLite and Postgres ignore this setting. |
-
-Copy [`.env.example`](../.env.example) to `.env` for Node, or [`dev.vars.example`](../dev.vars.example) to `.dev.vars` for `wrangler dev`. Both real files are gitignored.
-
-On Cloudflare, set the bearer token with `npx wrangler secret put HEALTH_INGEST_TOKEN`. Set the optional write-only URL token the same way, `npx wrangler secret put HEALTH_INGEST_URL_TOKEN`, only if a phone cannot send the header. Do not put either secret in `[vars]`. Put `HEALTH_TIMEZONE` in `[vars]` if you do not want `UTC`. The example file sets it to `America/Los_Angeles`; the code still defaults to `UTC` when the variable is absent. Copy [`wrangler.example.toml`](../wrangler.example.toml) to `wrangler.toml` (gitignored) and replace `database_id`. Set `account_id` in that local file only if Wrangler should target an account other than the one you are logged in to. Do not commit either value, and do not commit a custom hostname.
-
-## Development
-
-```bash
-npm install
-npm test
-```
-
-`npm test` runs the core against an in-memory storage fake, the Cloudflare adapter against a D1-shaped wrapper over SQLite, and the Node adapter over HTTP with a SQLite file. The Postgres adapter is tested with a fake client that records SQL, so a database server is not required. GitHub Actions runs the same command on pull requests and on pushes to `main`.
-
-## Layout
-
-```
-src/core                 parse, daily aggregate, summarize, bearer auth, HTTP, MCP
-src/core/ingest-guard.js recency window, body limit, rate limit, initial import window, unchanged rows
-src/core/hk.js           HealthKit quantity and workout names
-src/core/apple-export.js streaming export.xml and zip parser
-src/core/health-export-pro.js
-src/core/syncfit.js      SyncFit schemaVersion 1
-src/core/health-connect.js  shared Health Connect units and exercise names
-src/core/hc-webhook.js   HC Webhook JSON
-src/core/life-dashboard.js  Life Dashboard Companion JSON
-src/core/shortcuts.js       iOS Shortcuts JSON
-src/cli/import-apple-health.js
-src/adapters/d1.js       D1 storage
-src/adapters/cloudflare.js
-src/adapters/node.js     node:http server
-src/adapters/sqlite.js
-src/adapters/postgres.js
-src/index.js             Wrangler entry
-migrations/0001_init.sql
-migrations/0002_daily_points.sql
-migrations/0003_ingest_guards.sql
-migrations/0004_ingest_backfill.sql
-migrations/0005_quota_window_bigint.sql
-migrations/0006_ingest_backfill_deadline.sql
-```
-
-The storage interface is `insertIngest(batch)`, `queryDaySummary(date)`, `queryMetricRange(metric, startDate, endDate)`, `listMetrics()`, and `listWorkouts(startDate, endDate)`. `batch.points` is already one row per `(metric, date)` (`sum_qty`, `last_qty`, `last_ts`, `units`, `n`). `storeRaw: false` skips the raw body. `queryDaySummary` returns the `/summary` object. The three range methods only read. `MemoryStorage` in `src/core/memory.js` is the reference implementation. It is process-local and not persistent: a new process has no import-window row and no stored data, so the next stored point can open a window, and a restart does not keep a closed window.
+R2 and Workers free-plan quotas are separate. A route-heavy import writes one R2 object per workout that has a series.
