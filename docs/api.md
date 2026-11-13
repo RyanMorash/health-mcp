@@ -10,7 +10,7 @@ Health Auto Export version 2. The body is `{ "data": { ... } }` or the `data` ob
 
 Steady state stores today and yesterday in `HEALTH_TIMEZONE` (`INGEST_MAX_AGE_DAYS`, default `1`). The first accepted ingest opens the initial import window. While it is open, or before any ingest has been stored, older dates are kept, subject to `INGEST_MIN_DATE` and the window's byte cap. Dates more than a day in the future are dropped.
 
-Close the window with `{"backfill":"done"}` or the header `X-Backfill: done`. A successful response includes `backfill`: `open`, `closes_at`, and `bytes_remaining`.
+Close the window with `{"backfill":"done"}` or the header `X-Backfill: done`. A successful response includes `backfill`: `open`, `closes_at`, and `bytes_remaining`. Sending the same post again does not add its bytes a second time. If the window row was missing, that retry rebuilds it from the stored receipts.
 
 | Status | `error` | When |
 | --- | --- | --- |
