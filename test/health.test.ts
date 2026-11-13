@@ -1,7 +1,7 @@
 /// <reference types="@cloudflare/vitest-plugin/types" />
 import { env, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { parseAppleExport } from "../src/parse/apple.js";
+import { AppleExportError, parseAppleExport } from "../src/parse/apple.js";
 import { metricRollup } from "../src/storage.js";
 
 const TOKEN = "Bearer test-token";
@@ -363,5 +363,207 @@ describe("MCP", () => {
     const keyRow = await testEnv.DB.prepare("SELECT series_key FROM workouts WHERE series_key IS NOT NULL LIMIT 1").first<{ series_key: string }>();
     const series = await callTool("get_series", { key: keyRow?.series_key, part: "route" });
     expect(JSON.stringify(series)).toContain("37.77");
+  });
+});
+
+const WATCH = "Ryan\u2019s Apple Watch";
+const PHONE = "Ryan\u2019s iPhone";
+
+function step(source: string, value: number, day: string, start: string, end: string): string {
+  return `<Record type="HKQuantityTypeIdentifierStepCount" sourceName="${source}" unit="count" value="${value}" startDate="${day} ${start} -0500" endDate="${day} ${end} -0500"/>`;
+}
+
+function zipLocal(name: string, method: number, flags: number, data: Uint8Array): Uint8Array {
+  const nameBytes = new TextEncoder().encode(name);
+  const bytes = new Uint8Array(30 + nameBytes.length + data.length);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(0, 0x04034b50, true);
+  view.setUint16(4, 20, true);
+  view.setUint16(6, flags, true);
+  view.setUint16(8, method, true);
+  view.setUint32(18, data.length, true);
+  view.setUint32(22, data.length, true);
+  view.setUint16(26, nameBytes.length, true);
+  bytes.set(nameBytes, 30);
+  bytes.set(data, 30 + nameBytes.length);
+  return bytes;
+}
+
+function dataDescriptor(size: number, signed: boolean): Uint8Array {
+  const bytes = new Uint8Array(signed ? 16 : 12);
+  const view = new DataView(bytes.buffer);
+  const offset = signed ? 4 : 0;
+  if (signed) view.setUint32(0, 0x08074b50, true);
+  view.setUint32(offset + 4, size, true);
+  view.setUint32(offset + 8, size, true);
+  return bytes;
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+describe("Apple source dedupe", () => {
+  it("merges overlapping Watch and iPhone samples instead of summing the day", async () => {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+  <ExportDate value="2026-11-12 08:00:00 -0500"/>
+  ${step(WATCH, 2248, "2026-11-09", "10:00:00", "11:00:00")}
+  ${step(PHONE, 1217, "2026-11-09", "10:00:00", "11:00:00")}
+  ${step(WATCH, 8748, "2026-11-05", "10:00:00", "11:00:00")}
+  ${step(PHONE, 7492, "2026-11-05", "10:00:00", "11:00:00")}
+  ${step(WATCH, 32, "2026-11-10", "10:00:00", "11:00:00")}
+  ${step(PHONE, 73, "2026-11-10", "10:00:00", "11:00:00")}
+  ${step(WATCH, 939, "2026-11-06", "08:00:00", "12:00:00")}
+  ${step(PHONE, 2297, "2026-11-06", "08:00:00", "20:00:00")}
+  ${step(WATCH, 100, "2026-11-02", "08:00:00", "09:00:00")}
+  ${step(PHONE, 40, "2026-11-02", "12:00:00", "13:00:00")}
+  <Record type="HKQuantityTypeIdentifierStepCount" sourceName="${WATCH}" unit="count" value="100" startDate="2026-11-03 23:00:00 -0500" endDate="2026-11-04 01:00:00 -0500"/>
+  ${step(WATCH, 50, "2026-11-08", "10:00:00", "11:00:00")}
+  ${step("Ryan's iPhone", 20, "2026-11-08", "10:00:00", "11:00:00")}
+  ${step("Ryan\u2019s iPhone 13 Pro", 15, "2026-11-08", "11:00:00", "12:00:00")}
+  ${step("Ryan\u2019s iPhone XS", 15, "2026-11-08", "11:00:00", "12:00:00")}
+  <Record type="HKQuantityTypeIdentifierHeartRate" sourceName="${WATCH}" unit="count/min" value="60" startDate="2026-11-07 08:00:00 -0500" endDate="2026-11-07 08:00:00 -0500"/>
+  <Record type="HKQuantityTypeIdentifierHeartRate" sourceName="${WATCH}" unit="count/min" value="80" startDate="2026-11-07 09:00:00 -0500" endDate="2026-11-07 09:00:00 -0500"/>
+  <Record type="HKQuantityTypeIdentifierHeartRate" sourceName="${PHONE}" unit="count/min" value="40" startDate="2026-11-07 08:00:00 -0500" endDate="2026-11-07 08:00:00 -0500"/>
+  <Record type="HKQuantityTypeIdentifierHeartRate" sourceName="${PHONE}" unit="count/min" value="120" startDate="2026-11-07 09:00:00 -0500" endDate="2026-11-07 09:00:00 -0500"/>
+  <Record type="HKQuantityTypeIdentifierBodyMass" sourceName="${WATCH}" unit="kg" value="80" startDate="2026-11-07 08:00:00 -0500" endDate="2026-11-07 08:00:00 -0500"/>
+  <Record type="HKQuantityTypeIdentifierBodyMass" sourceName="Withings" unit="kg" value="72" startDate="2026-11-07 21:00:00 -0500" endDate="2026-11-07 21:00:00 -0500"/>
+  <Record type="HKCategoryTypeIdentifierSleepAnalysis" sourceName="${WATCH}" value="HKCategoryValueSleepAnalysisAsleepCore" startDate="2026-11-09 23:00:00 -0500" endDate="2026-11-10 06:10:00 -0500"/>
+  <Record type="HKCategoryTypeIdentifierSleepAnalysis" sourceName="${PHONE}" value="HKCategoryValueSleepAnalysisInBed" startDate="2026-11-10 06:10:00 -0500" endDate="2026-11-10 23:56:00 -0500"/>
+  <Record type="HKCategoryTypeIdentifierSleepAnalysis" sourceName="${PHONE}" value="HKCategoryValueSleepAnalysisAwake" startDate="2026-11-10 06:10:00 -0500" endDate="2026-11-10 07:00:00 -0500"/>
+  <Record type="HKCategoryTypeIdentifierSleepAnalysis" sourceName="${PHONE}" value="HKCategoryValueSleepAnalysisAsleepCore" startDate="2026-11-10 07:00:00 -0500" endDate="2026-11-10 08:00:00 -0500"/>
+  <Record type="HKCategoryTypeIdentifierSleepAnalysis" sourceName="Clock" value="HKCategoryValueSleepAnalysisInBed" startDate="2026-11-10 06:10:00 -0500" endDate="2026-11-10 23:56:00 -0500"/>
+</HealthData>`;
+    const parsed = await parseAppleExport(xml, { timeZone: "America/New_York", sourcePriority: "Apple Watch,iPhone" });
+    const steps = (date: string) => parsed.samples.find((sample) => sample.metric === "step_count" && sample.date === date);
+
+    expect(steps("2026-11-09")?.qty).toBe(2248);
+    expect(steps("2026-11-05")?.qty).toBe(8748);
+    expect(steps("2026-11-10")?.qty).toBe(32);
+    expect(steps("2026-11-06")?.qty).toBeCloseTo(939 + (2297 * 8) / 12, 5);
+    expect(steps("2026-11-02")?.qty).toBe(140);
+    expect(steps("2026-11-03")?.qty).toBe(50);
+    expect(steps("2026-11-04")?.qty).toBe(50);
+
+    const late = await parseAppleExport(
+      `<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+  <ExportDate value="2026-11-12 08:00:00 -0500"/>
+  <Record type="HKQuantityTypeIdentifierStepCount" sourceName="Apple Watch" unit="count" value="100" startDate="2026-11-04 04:00:00" endDate="2026-11-04 06:00:00"/>
+  <Record type="HKQuantityTypeIdentifierStepCount" sourceName="Apple Watch" unit="count" value="100" startDate="2026-03-07 23:00:00 -0500" endDate="2026-03-08 04:00:00 -0400"/>
+</HealthData>`,
+      { timeZone: "America/New_York" },
+    );
+    const lateSteps = (date: string) => late.samples.find((sample) => sample.metric === "step_count" && sample.date === date);
+    expect(lateSteps("2026-11-03")?.qty).toBeCloseTo(50, 5);
+    expect(lateSteps("2026-11-04")?.qty).toBeCloseTo(50, 5);
+    expect(lateSteps("2026-03-07")?.qty).toBeCloseTo(25, 5);
+    expect(lateSteps("2026-03-08")?.qty).toBeCloseTo(75, 5);
+    expect(steps("2026-11-08")).toMatchObject({ qty: 65, source: WATCH });
+
+    expect(parsed.samples.find((sample) => sample.metric === "heart_rate")).toMatchObject({
+      qty_min: 60,
+      qty_avg: 70,
+      qty_max: 80,
+      source: WATCH,
+    });
+    expect(parsed.samples.find((sample) => sample.metric === "weight_body_mass")).toMatchObject({ qty: 72, source: "Withings" });
+
+    const sleep = parsed.samples.filter((sample) => sample.metric === "sleep_analysis");
+    expect(sleep.length).toBeGreaterThan(0);
+    expect(sleep.every((sample) => sample.source === WATCH)).toBe(true);
+    expect(sleep.some((sample) => sample.end_ts?.includes("23:56"))).toBe(false);
+    expect(sleep[0]).toMatchObject({ date: "2026-11-10", label: "Core" });
+  });
+
+  it("replaces source-keyed Apple rows so a rerun is not added to the old total", async () => {
+    const day = "2026-11-06";
+    await testEnv.DB.batch([
+      testEnv.DB
+        .prepare(
+          "INSERT INTO samples (id, metric, date, start_ts, source, qty, units, kind, extra) VALUES ('legacy-watch', 'step_count', ?, ?, ?, 939, 'count', 'sum', '{\"apple\":true}')",
+        )
+        .bind(day, `${day} 00:00:00`, WATCH),
+      testEnv.DB
+        .prepare(
+          "INSERT INTO samples (id, metric, date, start_ts, source, qty, units, kind, extra) VALUES ('legacy-phone', 'step_count', ?, ?, ?, 2297, 'count', 'sum', '{\"apple\":true}')",
+        )
+        .bind(day, `${day} 00:00:00`, PHONE),
+      testEnv.DB
+        .prepare(
+          "INSERT INTO samples (id, metric, date, start_ts, source, qty, units, kind, extra) VALUES ('legacy-other-day', 'step_count', '2026-11-01', '2026-11-01 00:00:00', ?, 10, 'count', 'sum', '{\"apple\":true}')",
+        )
+        .bind(WATCH),
+    ]);
+    const doubled = await metricRollup(testEnv.DB, "step_count", day, day, 500);
+    expect(doubled.rows).toEqual([{ date: day, qty: 3236, units: "count" }]);
+
+    const parsed = await parseAppleExport(
+      `<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+  <ExportDate value="2026-11-12 08:00:00 -0500"/>
+  ${step(WATCH, 939, day, "08:00:00", "12:00:00")}
+  ${step(PHONE, 2297, day, "08:00:00", "20:00:00")}
+</HealthData>`,
+      { timeZone: "America/New_York", sourcePriority: "Apple Watch,iPhone" },
+    );
+    const imported = await postJson("/import/apple-health/chunk", parsed);
+    expect(imported.status).toBe(200);
+    const rolled = await metricRollup(testEnv.DB, "step_count", day, day, 500);
+    const rolledRow = rolled.rows[0] as { date: string; qty: number };
+    expect(rolledRow.date).toBe(day);
+    expect(rolledRow.qty).toBeCloseTo(939 + (2297 * 8) / 12, 5);
+    const rows = await testEnv.DB.prepare("SELECT id, qty FROM samples WHERE metric = 'step_count' AND date = ?").bind(day).all<{ id: string; qty: number }>();
+    expect(rows.results).toHaveLength(1);
+    expect(rows.results[0]?.id).not.toBe("legacy-watch");
+    const kept = await testEnv.DB.prepare("SELECT qty FROM samples WHERE id = 'legacy-other-day'").first<{ qty: number }>();
+    expect(kept?.qty).toBe(10);
+
+    expect((await postJson("/ingest", {
+      data: { metrics: [{ name: "step_count", units: "count", data: [{ qty: 50, date: `${day} 12:00:00 -0500`, source: "iPhone" }] }] },
+    })).status).toBe(200);
+    const preferred = await metricRollup(testEnv.DB, "step_count", day, day, 500);
+    expect(preferred.rows).toEqual([{ date: day, qty: 50, units: "count" }]);
+    const appleLeft = await testEnv.DB
+      .prepare("SELECT qty FROM samples WHERE metric = 'step_count' AND date = ? AND json_extract(COALESCE(extra, '{}'), '$.apple') = 1")
+      .bind(day)
+      .all<{ qty: number }>();
+    expect(appleLeft.results).toHaveLength(1);
+  });
+
+  it("reads a stored zip and rejects compression it cannot inflate", async () => {
+    const xml = new TextEncoder().encode(`<?xml version="1.0" encoding="UTF-8"?>
+<HealthData locale="en_US">
+  <ExportDate value="2024-02-07 08:00:00 -0800"/>
+  <Record type="HKQuantityTypeIdentifierStepCount" sourceName="Apple Watch" unit="count" value="10" startDate="2024-02-06 10:00:00 -0800" endDate="2024-02-06 10:00:00 -0800"/>
+</HealthData>`);
+    const stored = await parseAppleExport(zipLocal("export.xml", 0, 0, xml), { timeZone: "America/Los_Angeles" });
+    expect(stored.samples.find((sample) => sample.metric === "step_count")?.qty).toBe(10);
+    const described = await parseAppleExport(concatBytes([zipLocal("export.xml", 0, 0x8, xml), dataDescriptor(xml.length, true)]), {
+      timeZone: "America/Los_Angeles",
+    });
+    expect(described.samples.find((sample) => sample.metric === "step_count")?.qty).toBe(10);
+    const notes = new TextEncoder().encode("notes");
+    const ahead = concatBytes([
+      zipLocal("workout-routes/note.txt", 0, 0x8, notes),
+      dataDescriptor(notes.length, false),
+      zipLocal("export.xml", 0, 0, xml),
+    ]);
+    const afterSkipped = await parseAppleExport(ahead, { timeZone: "America/Los_Angeles" });
+    expect(afterSkipped.samples.find((sample) => sample.metric === "step_count")?.qty).toBe(10);
+
+    await expect(parseAppleExport(zipLocal("export.xml", 9, 0, xml))).rejects.toMatchObject({ code: "UNSUPPORTED_ZIP" });
+    await expect(parseAppleExport(zipLocal("export.xml", 9, 0, xml))).rejects.toThrow(/ditto -x -k/);
+    const zeroSized = zipLocal("export.xml", 0, 0x8, xml);
+    new DataView(zeroSized.buffer).setUint32(18, 0, true);
+    new DataView(zeroSized.buffer).setUint32(22, 0, true);
+    await expect(parseAppleExport(zeroSized)).rejects.toBeInstanceOf(AppleExportError);
   });
 });

@@ -47,7 +47,17 @@ The mapper reads:
 - `ActivitySummary` move, exercise, and stand rings only when that metric is missing for the day
 - anything else, as an event with its type, time, value, unit, and source
 
-Cumulative quantities keep one source per metric and day. Set `HEALTH_SOURCE_PRIORITY` (or `--source-priority`) to a comma-separated source list. When it is unset, the largest total wins. Latest values, such as weight, keep the newest sample of the chosen source. Heart rate and other min/avg/max metrics become one daily bucket per source, then one source is kept. Sleep segments keep one source for the wake day.
+Cumulative quantities (steps, distance, active energy, and the other daily sums) are merged by time. A higher-priority source keeps its intervals, and a lower-priority source adds only the part of the day it alone covered, scaled by that fraction of its sample. `--source-priority` defaults to `Apple Watch,iPhone`. Matching is case-insensitive, ignores straight and curly apostrophes, and treats every iPhone generation as one device and every Apple Watch as one device. `Ryan’s Apple Watch` matches `Apple Watch`. Two iPhones do not both count the same minute.
+
+Weight and other latest metrics keep the newest sample. Heart rate and other min/avg/max metrics keep one source for the day, the highest-priority source that recorded it. Sleep keeps one source for the wake day: the highest-priority source that has asleep stages, otherwise the highest-priority source that has any segment. Clock loses to a real sleep source when it was not listed in the priority.
+
+Posting a chunk again deletes Apple-import samples for the dates in that chunk, then inserts the new rows. Health Auto Export rows on those dates stay. Sample ids used to include the source name, so a rerun that only upserted would leave the other source in place and `query_metrics` would add the two rows. To drop Apple-import rows from dates the new file does not contain:
+
+```bash
+npx wrangler d1 execute health-mcp --remote --command "DELETE FROM samples WHERE json_extract(COALESCE(extra, '{}'), '$.apple') = 1"
+```
+
+Then run the importer again. No schema migration is required.
 
 Samples on the export day itself are dropped. That day is still in progress in the file. Health Auto Export fills it afterward. If Health Auto Export later stores the same metric on a day the import already filled, summaries and `query_metrics` use the Health Auto Export samples for that day and do not add the Apple total on top.
 

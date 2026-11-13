@@ -79,6 +79,8 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help || !options.file || !options.chunkUrl) {
     console.error("Usage: npm run import:apple -- <export.xml|export.zip> --chunk-url URL [--time-zone TZ] [--source-priority Names] [--dates-per-chunk N]");
+    console.error("Default source priority is Apple Watch, then iPhone. Names match device class, ignoring case and apostrophes.");
+    console.error("If the zip fails, unzip it with: ditto -x -k export.zip export-dir");
     console.error("Set HEALTH_INGEST_TOKEN in the environment. A token on the command line is visible to other users on the machine.");
     process.exit(options.help ? 0 : 1);
   }
@@ -91,7 +93,7 @@ async function main() {
 }
 
 main().catch((error: unknown) => {
-  const message = error instanceof AppleExportError ? error.code : error instanceof Error ? error.message : String(error);
+  const message = error instanceof AppleExportError ? error.message : error instanceof Error ? error.message : String(error);
   console.error(message);
   process.exit(1);
 });
