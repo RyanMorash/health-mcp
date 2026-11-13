@@ -1,5 +1,5 @@
 import { shouldStoreRaw } from "./aggregate.js";
-import { pointsAfterSamples, rowsToWrite } from "./health-rows.js";
+import { mergeWorkoutDetails, pointsAfterSamples, rowsToWrite } from "./health-rows.js";
 import { countNewDays, hintAction, partitionIngest, withExportHint } from "./ingest-guard.js";
 import { summarizeDay } from "./summary.js";
 
@@ -220,7 +220,8 @@ export class MemoryStorage {
       points: [...this.points.values()],
       workouts: [...this.workouts.values()],
     };
-    const diff = partitionIngest(points, batch.workouts, stored);
+    const workouts = mergeWorkoutDetails(batch.workouts, [...this.workouts.values()]);
+    const diff = partitionIngest(points, workouts, stored);
     const newDays = countNewDays(points, batch.workouts, stored);
     for (const point of diff.points) {
       const { replace, ...stored } = point;
@@ -293,6 +294,12 @@ export class MemoryStorage {
     return [...this.points.values()]
       .filter((point) => point.date >= start && point.date <= end)
       .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.metric < b.metric ? -1 : 1));
+  }
+
+  async queryDailyPage(start, end, metric, limit, offset) {
+    const rows = (await this.queryPointsBetween(start, end))
+      .filter((point) => !metric || point.metric === metric);
+    return rows.slice(offset, offset + limit);
   }
 
   async listCoverage() {

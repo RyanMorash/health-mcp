@@ -1,5 +1,3 @@
-import { aggregateDays } from "./aggregate.js";
-
 const ASLEEP_STAGES = new Set(["asleep", "core", "rem", "deep", "unspecified"]);
 
 /** Rows whose stored signature already matches are not written again. */
@@ -39,13 +37,29 @@ export function dailyFromSamples(samples) {
       if (asleep.length) use = asleep;
     }
     use.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    let sum = 0;
+    let n = 0;
+    let last = null;
     for (const row of use) {
       const qty = row.qty != null ? Number(row.qty) : row.avg_qty != null ? Number(row.avg_qty) : null;
       if (qty == null || !Number.isFinite(qty)) continue;
-      flat.push({ metric: row.metric, date: row.date, ts: row.ts, qty, units: row.units ?? null });
+      sum += qty;
+      n += 1;
+      if (!last || String(row.ts) >= String(last.ts)) last = { ...row, qty };
     }
+    if (!last) continue;
+    flat.push({
+      metric: use[0].metric,
+      date: use[0].date,
+      sum_qty: sum,
+      last_qty: last.qty,
+      last_ts: String(last.ts),
+      units: last.units ?? null,
+      n,
+    });
   }
-  return aggregateDays(flat, null);
+  flat.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.metric < b.metric ? -1 : a.metric > b.metric ? 1 : 0));
+  return flat;
 }
 
 /** Replace daily rows for metrics this payload touched with totals from stored samples. */
@@ -57,10 +71,62 @@ export function pointsAfterSamples(points, incoming, storedSamples) {
   const map = new Map((points || []).map((point) => [`${point.date}\0${point.metric}`, point]));
   for (const point of recomputed) {
     const key = `${point.date}\0${point.metric}`;
-    const prev = map.get(key);
-    map.set(key, prev?.replace ? { ...point, replace: true } : point);
+    // The rebuilt row is the source of truth, even when it has fewer samples
+    // than the daily row already stored.
+    map.set(key, { ...point, replace: true });
   }
   return [...map.values()];
+}
+
+const DETAIL_ARRAYS = new Set([
+  "heartRateData",
+  "heartRateRecovery",
+  "route",
+  "activeEnergy",
+  "basalEnergy",
+  "stepCount",
+  "events",
+  "segments",
+  "laps",
+  "activities",
+  "splits",
+]);
+
+function parseDetail(value) {
+  if (value == null || value === "") return null;
+  if (typeof value === "object") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+/** Keep route and series from an earlier export when this post left them out. */
+export function mergeDetailJson(previous, incoming) {
+  const oldDetail = parseDetail(previous);
+  const nextDetail = parseDetail(incoming);
+  if (!oldDetail || !nextDetail) return incoming ?? previous ?? null;
+  const merged = { ...oldDetail };
+  for (const [key, value] of Object.entries(nextDetail)) {
+    if (value == null) continue;
+    if (Array.isArray(value) && value.length === 0 && Array.isArray(oldDetail[key]) && oldDetail[key].length) continue;
+    if (DETAIL_ARRAYS.has(key) && !Array.isArray(value)) {
+      merged[key] = value;
+      continue;
+    }
+    merged[key] = value;
+  }
+  return JSON.stringify(merged);
+}
+
+export function mergeWorkoutDetails(workouts, storedWorkouts) {
+  const previous = new Map((storedWorkouts || []).map((workout) => [`${workout.name}\0${workout.start}`, workout]));
+  return (workouts || []).map((workout) => {
+    const stored = previous.get(`${workout.name}\0${workout.start}`);
+    if (!stored?.detail || workout.detail == null) return workout;
+    return { ...workout, detail: mergeDetailJson(stored.detail, workout.detail) };
+  });
 }
 
 export function uniqueDates(rows) {

@@ -56,9 +56,8 @@ export async function exportDataset(storage, {
     }
     rows = await storage.querySamples(String(metric).toLowerCase(), start, end, size + 1, offset);
   } else if (dataset === "daily") {
-    const all = await storage.queryPointsBetween(start, end);
-    const filtered = metric ? all.filter((row) => row.metric === String(metric).toLowerCase()) : all;
-    return finish(dataset, format, page(filtered, offset, size));
+    const metricName = metric ? String(metric).toLowerCase() : "";
+    rows = await storage.queryDailyPage(start, end, metricName, size + 1, offset);
   } else if (dataset === "sleep") {
     rows = await storage.querySleep(start, end, size + 1, offset);
   } else if (dataset === "workouts") {

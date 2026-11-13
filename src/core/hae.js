@@ -149,6 +149,29 @@ function timestamp(sample) {
   return sample?.date || sample?.start || sample?.startDate || sample?.sleepStart || null;
 }
 
+/** Health Auto Export uses 00:00:00 for an all-day summary point. */
+export function isDayBoundary(ts) {
+  return /(?:T|\s)00:00:00(?:\.\d+)?(?:Z|\s*[+-]\d{2}:?\d{2})?$/.test(String(ts || ""));
+}
+
+/**
+ * A lone midnight sample is an all-day total. Midnight is a normal reading
+ * when that metric already has other samples on the same day.
+ */
+export function markDayTotals(samples) {
+  const counts = new Map();
+  for (const sample of samples || []) {
+    const key = `${sample.metric}\0${sample.date}`;
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  for (const sample of samples || []) {
+    if (sample.grain !== "reading") continue;
+    if (counts.get(`${sample.metric}\0${sample.date}`) !== 1) continue;
+    if (isDayBoundary(sample.ts)) sample.grain = "day";
+  }
+  return samples;
+}
+
 /**
  * One metric reading, plus a daily point when the common qty/Avg loop would
  * have skipped it (sleep summaries, blood pressure, sexual activity).
@@ -371,7 +394,7 @@ async function withSig(row, identity, content) {
 export async function identifyHealth({ samples = [], sleep = [], records = [], workouts = [], workoutMetaRows = [] } = {}) {
   const sampleRows = [];
   for (const row of samples) {
-    const identity = ["sample", row.metric, row.ts, row.end_ts, row.source, row.value, row.grain];
+    const identity = ["sample", row.metric, row.ts, row.end_ts, row.source, row.value, row.grain, row.extra];
     sampleRows.push(await withSig(row, identity, [row.qty, row.min_qty, row.max_qty, row.avg_qty, row.units, row.extra]));
   }
   const sleepRows = [];

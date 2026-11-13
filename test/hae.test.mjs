@@ -259,6 +259,131 @@ test("MCP tools page raw metrics, sleep, workouts, records, and export", async (
   assert.equal(denied.status, 401);
 });
 
+test("a later raw export replaces an all-day total instead of adding to it", async () => {
+  const storage = new MemoryStorage();
+  const environment = ctx(storage);
+  const summary = {
+    data: {
+      metrics: [{ name: "step_count", units: "count", data: [{ qty: 9000, date: "2020-03-01 00:00:00 -0500" }] }],
+    },
+  };
+  const raw = {
+    data: {
+      metrics: [{
+        name: "step_count",
+        units: "count",
+        data: [
+          { qty: 100, date: "2020-03-01 09:00:00 -0500" },
+          { qty: 50, date: "2020-03-01 18:00:00 -0500" },
+        ],
+      }],
+    },
+  };
+  assert.equal((await handleRequest(request("/ingest", { body: JSON.stringify(summary) }), environment)).status, 200);
+  assert.equal((await storage.queryDaySummary("2020-03-01")).steps, 9000);
+  assert.equal((await handleRequest(request("/ingest", { body: JSON.stringify(raw) }), environment)).status, 200);
+  assert.equal((await storage.queryDaySummary("2020-03-01")).steps, 150);
+});
+
+test("a smaller raw set replaces a larger bucket total", async () => {
+  const storage = new MemoryStorage();
+  const environment = ctx(storage);
+  const buckets = {
+    data: {
+      metrics: [{
+        name: "heart_rate",
+        units: "count/min",
+        data: [8, 9, 10, 11].map((hour) => ({
+          date: `2020-03-01 ${String(hour).padStart(2, "0")}:00:00 -0500`,
+          Min: 60,
+          Avg: 70,
+          Max: 80,
+        })),
+      }],
+    },
+  };
+  const raw = {
+    data: {
+      metrics: [{
+        name: "heart_rate",
+        units: "count/min",
+        data: [
+          { qty: 72, date: "2020-03-01 09:15:00 -0500" },
+          { qty: 80, date: "2020-03-01 10:15:00 -0500" },
+        ],
+      }],
+    },
+  };
+  await handleRequest(request("/ingest", { body: JSON.stringify(buckets) }), environment);
+  await handleRequest(request("/ingest", { body: JSON.stringify(raw) }), environment);
+  const row = (await storage.queryMetricRange("heart_rate", "2020-03-01", "2020-03-01"))[0];
+  assert.equal(row.n, 2);
+  assert.equal(row.sum_qty, 152);
+});
+
+test("two foods logged at the same time are both stored", async () => {
+  const storage = new MemoryStorage();
+  const environment = ctx(storage);
+  const body = {
+    data: {
+      metrics: [{
+        name: "dietary_energy",
+        units: "kcal",
+        data: [
+          { qty: 100, date: "2020-03-01 08:00:00 -0500", foodType: "Apple", source: "Lose It!" },
+          { qty: 240, date: "2020-03-01 08:00:00 -0500", foodType: "Oats", source: "Lose It!" },
+        ],
+      }],
+    },
+  };
+  await handleRequest(request("/ingest", { body: JSON.stringify(body) }), environment);
+  const samples = await storage.querySamples("dietary_energy", "2020-03-01", "2020-03-01", 10, 0);
+  assert.equal(samples.length, 2);
+  assert.equal((await storage.queryDaySummary("2020-03-01")).dietary_kcal, 340);
+});
+
+test("a later workout without a route keeps the stored route", async () => {
+  const storage = new MemoryStorage();
+  const environment = ctx(storage);
+  const rich = {
+    data: {
+      workouts: [{
+        name: "Running",
+        start: "2020-03-01 07:00:00 -0500",
+        end: "2020-03-01 07:30:00 -0500",
+        duration: 1800,
+        activeEnergyBurned: { qty: 280, units: "kcal" },
+        route: [{ latitude: 40.7, longitude: -74.0, timestamp: "2020-03-01 07:00:00 -0500" }],
+      }],
+    },
+  };
+  const slim = {
+    data: {
+      workouts: [{
+        name: "Running",
+        start: "2020-03-01 07:00:00 -0500",
+        end: "2020-03-01 07:30:00 -0500",
+        duration: 1800,
+        activeEnergyBurned: { qty: 280, units: "kcal" },
+      }],
+    },
+  };
+  await handleRequest(request("/ingest", { body: JSON.stringify(rich) }), environment);
+  await handleRequest(request("/ingest", { body: JSON.stringify(slim) }), environment);
+  const [workout] = await storage.queryWorkoutDetails("2020-03-01", "2020-03-01", 5, 0);
+  assert.match(workout.detail, /latitude/);
+});
+
+test("daily export returns one page from the database", async () => {
+  const storage = new MemoryStorage();
+  const environment = ctx(storage);
+  await handleRequest(request("/ingest", { body: JSON.stringify(payload) }), environment);
+  const response = await handleRequest(request("/export?dataset=daily&limit=1&start=2020-01-01&end=2020-12-31", { method: "GET" }), environment);
+  const body = await response.json();
+  assert.equal(body.rows.length, 1);
+  assert.equal(body.next_cursor, "1");
+});
+
 test("the worker entry does not evaluate import.meta.url while loading", () => {
   const source = fs.readFileSync(new URL("../src/adapters/migrate.js", import.meta.url), "utf8");
   const prelude = source.split("function migrationsDirectory")[0];

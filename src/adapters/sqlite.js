@@ -6,7 +6,7 @@ import { countNewDays, dateGroups, hintAction, MAX_INGEST_DATES, normalizeBackfi
 import { summarizeDay } from "../core/summary.js";
 import { healthWriteChunks, ingestWriteChunks } from "./bulk.js";
 import { bindHealthReads } from "./health-read.js";
-import { pointsAfterSamples, rowsToWrite, uniqueDates } from "../core/health-rows.js";
+import { mergeWorkoutDetails, pointsAfterSamples, rowsToWrite, uniqueDates } from "../core/health-rows.js";
 import { migrationFiles, statementsForSqlite } from "./migrate.js";
 import { INSERT_RAW, LIST_METRICS, METRIC_RANGE, POINTS_FOR_DATE, POINTS_ON_DATES,
   UPSERT_POINTS_JSON, REPLACE_POINTS_JSON, UPSERT_WORKOUTS_JSON, INSERT_WORKOUTS_JSON,
@@ -109,7 +109,8 @@ export function createSqliteStorage(filename) {
       ...healthDates,
     ])];
     const stored = loadSpan(dates);
-    const diff = partitionIngest(points, batch.workouts, stored);
+    const workouts = mergeWorkoutDetails(batch.workouts, stored.workouts);
+    const diff = partitionIngest(points, workouts, stored);
     const newDays = countNewDays(points, batch.workouts, stored);
     if (options.markOrigin) {
       const markerId = options.markOrigin === "apple" ? APPLE_MARKER_ID : INGEST_MARKER_ID;

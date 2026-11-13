@@ -1,5 +1,5 @@
 import { localDate } from "./dates.js";
-import { haeArrayError, haeData, readingFromMetric, recordsFrom, sleepFromMetric, workoutMeta } from "./hae.js";
+import { haeArrayError, haeData, markDayTotals, readingFromMetric, recordsFrom, sleepFromMetric, workoutMeta } from "./hae.js";
 import { DEFAULT_TIME_ZONE, ENERGY_METRICS } from "./metrics.js";
 
 export { localDate } from "./dates.js";
@@ -96,7 +96,7 @@ export function parse(body, options = {}) {
   return {
     points: points.filter((point) => point.date),
     workouts: workouts.filter((workout) => workout.date),
-    samples: samples.filter((sample) => sample.date),
+    samples: markDayTotals(samples.filter((sample) => sample.date)),
     sleep: sleep.filter((row) => row.date),
     records: recordsFrom(data, timeZone),
     workoutMetaRows,

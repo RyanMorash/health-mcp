@@ -3,6 +3,8 @@ import {
   COVERAGE_RECORDS,
   COVERAGE_SLEEP,
   COVERAGE_WORKOUTS,
+  DAILY_METRIC_PAGE,
+  DAILY_PAGE,
   POINTS_BETWEEN_DATES,
   RECORDS_RANGE,
   SAMPLES_RANGE,
@@ -31,6 +33,10 @@ export function bindHealthReads(query) {
     },
     async queryPointsBetween(start, end) {
       return query(POINTS_BETWEEN_DATES, start, end);
+    },
+    async queryDailyPage(start, end, metric, limit, offset) {
+      if (metric) return query(DAILY_METRIC_PAGE, metric, start, end, limit, offset);
+      return query(DAILY_PAGE, start, end, limit, offset);
     },
     async listCoverage() {
       const [metrics, sleep, workouts, records] = await Promise.all([

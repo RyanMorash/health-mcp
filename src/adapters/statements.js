@@ -157,6 +157,14 @@ export const COVERAGE_RECORDS =
 export const POINTS_BETWEEN_DATES =
   "SELECT date, metric, sum_qty, last_qty, last_ts, units, n FROM points_daily WHERE date >= ? AND date <= ? ORDER BY date, metric";
 
+export const DAILY_PAGE =
+  "SELECT date, metric, sum_qty, last_qty, last_ts, units, n FROM points_daily " +
+  "WHERE date >= ? AND date <= ? ORDER BY date, metric LIMIT ? OFFSET ?";
+
+export const DAILY_METRIC_PAGE =
+  "SELECT date, metric, sum_qty, last_qty, last_ts, units, n FROM points_daily " +
+  "WHERE metric = ? AND date >= ? AND date <= ? ORDER BY date, metric LIMIT ? OFFSET ?";
+
 /**
  * Non-Apple ingest data counts as already stored. Apple rows alone do not:
  * an Apple import must not seal the window for a later ingest.

@@ -4,7 +4,7 @@ import { countNewDays, dateGroups, hintAction, MAX_INGEST_DATES, normalizeBackfi
 import { summarizeDay } from "../core/summary.js";
 import { healthWriteChunks, ingestWriteChunks } from "./bulk.js";
 import { bindHealthReads } from "./health-read.js";
-import { pointsAfterSamples, rowsToWrite, uniqueDates } from "../core/health-rows.js";
+import { mergeWorkoutDetails, pointsAfterSamples, rowsToWrite, uniqueDates } from "../core/health-rows.js";
 import { addedColumn, migrationFiles } from "./migrate.js";
 import {
   D1_BATCH_LIMIT,
@@ -226,7 +226,8 @@ export class D1Storage {
       ...healthDates,
     ])];
     const stored = await this.loadStored(dates);
-    const diff = partitionIngest(points, batch.workouts, stored);
+    const workouts = mergeWorkoutDetails(batch.workouts, stored.workouts);
+    const diff = partitionIngest(points, workouts, stored);
     const newDays = countNewDays(points, batch.workouts, stored);
     const chunks = ingestWriteChunks(diff.points, diff.workouts);
     const statements = [];

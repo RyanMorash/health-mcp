@@ -4,7 +4,7 @@ import { countNewDays, dateGroups, hintAction, MAX_INGEST_DATES, normalizeBackfi
 import { summarizeDay } from "../core/summary.js";
 import { healthWriteChunks, ingestWriteChunks } from "./bulk.js";
 import { bindHealthReads } from "./health-read.js";
-import { pointsAfterSamples, rowsToWrite, uniqueDates } from "../core/health-rows.js";
+import { mergeWorkoutDetails, pointsAfterSamples, rowsToWrite, uniqueDates } from "../core/health-rows.js";
 import { migrationFiles, statementsForPostgres } from "./migrate.js";
 import {
   DELETE_HINT,
@@ -257,7 +257,17 @@ export function createPostgresStorageFromPool(pool) {
       return true;
     },
     async insertIngest(batch, options = {}) {
-      const client = options.client || null;
+      if (!options.client) {
+        const held = await pool.connect();
+        return finishClient(held, async () => {
+          await held.query("BEGIN");
+          await setLocalTimeouts(held);
+          const result = await this.insertIngest(batch, { ...options, client: held });
+          await held.query("COMMIT");
+          return result;
+        });
+      }
+      const client = options.client;
       const sampleRows = batch.sampleRows || [];
       const sleepRows = batch.sleepRows || [];
       const recordRows = batch.recordRows || [];
@@ -289,7 +299,8 @@ export function createPostgresStorageFromPool(pool) {
         ...healthDates,
       ])];
       const stored = await this.loadStored(dates, client);
-      const diff = partitionIngest(points, batch.workouts, stored);
+      const workouts = mergeWorkoutDetails(batch.workouts, stored.workouts);
+      const diff = partitionIngest(points, workouts, stored);
       const newDays = countNewDays(points, batch.workouts, stored);
       let action = "skip";
       if (options.hint !== undefined) {
@@ -319,18 +330,9 @@ export function createPostgresStorageFromPool(pool) {
         if (action === "clear") await runner.query(toPostgres(DELETE_HINT));
         if (action === "set") await runner.query(toPostgres(UPSERT_HINT), [options.hint]);
       };
-      // A caller that already holds the ingest transaction must not check out
-      // another connection. Nested BEGIN would commit the outer transaction.
-      if (client) {
-        await write(client);
-        return { written: diff.written, unchanged: diff.unchanged, newDays };
-      }
-      const held = await pool.connect();
-      await finishClient(held, async () => {
-        await held.query("BEGIN");
-        await write(held);
-        await held.query("COMMIT");
-      });
+      // `client` is the caller's transaction, or the one opened above.
+      // Nested BEGIN would commit the outer transaction.
+      await write(client);
       return { written: diff.written, unchanged: diff.unchanged, newDays };
     },
     async queryDaySummary(date) {
