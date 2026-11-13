@@ -17,12 +17,14 @@ export const REPLACE_POINT =
 
 /** Insert-only workout, used for URL-token requests: an existing workout is never changed. */
 export const INSERT_WORKOUT_IF_NEW =
-  "INSERT INTO workouts (name, start, date, duration_min, kcal) VALUES (?, ?, ?, ?, ?) " +
+  "INSERT INTO workouts (name, start, date, duration_min, kcal, end_ts, source, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
   "ON CONFLICT(name, start) DO NOTHING";
 
 export const UPSERT_WORKOUT =
-  "INSERT INTO workouts (name, start, date, duration_min, kcal) VALUES (?, ?, ?, ?, ?) " +
-  "ON CONFLICT(name, start) DO UPDATE SET date = excluded.date, duration_min = excluded.duration_min, kcal = excluded.kcal";
+  "INSERT INTO workouts (name, start, date, duration_min, kcal, end_ts, source, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
+  "ON CONFLICT(name, start) DO UPDATE SET date = excluded.date, duration_min = excluded.duration_min, kcal = excluded.kcal, " +
+  "end_ts = COALESCE(excluded.end_ts, workouts.end_ts), source = COALESCE(excluded.source, workouts.source), " +
+  "detail = COALESCE(excluded.detail, workouts.detail)";
 
 export const POINTS_FOR_DATE =
   "SELECT date, metric, sum_qty, last_qty, last_ts, units, n FROM points_daily WHERE date = ?";
@@ -37,7 +39,7 @@ export const POINTS_ON_DATES =
 
 /** Workouts for an explicit date list. `?` is a JSON array of YYYY-MM-DD strings. */
 export const WORKOUTS_ON_DATES =
-  "SELECT name, start, date, duration_min, kcal FROM workouts " +
+  "SELECT name, start, date, duration_min, kcal, end_ts, source, detail FROM workouts " +
   "WHERE date IN (SELECT value FROM json_each(?))";
 
 /** One statement for many guarded point rows. `?` is a JSON array. */
@@ -60,18 +62,100 @@ export const REPLACE_POINTS_JSON =
   "last_ts = excluded.last_ts, units = excluded.units, n = excluded.n";
 
 export const UPSERT_WORKOUTS_JSON =
-  "INSERT INTO workouts (name, start, date, duration_min, kcal) " +
+  "INSERT INTO workouts (name, start, date, duration_min, kcal, end_ts, source, detail) " +
   "SELECT json_extract(value, '$.n'), json_extract(value, '$.s'), json_extract(value, '$.d'), " +
-  "json_extract(value, '$.m'), json_extract(value, '$.k') " +
+  "json_extract(value, '$.m'), json_extract(value, '$.k'), json_extract(value, '$.e'), " +
+  "json_extract(value, '$.src'), json_extract(value, '$.detail') " +
   "FROM json_each(?) WHERE true " +
-  "ON CONFLICT(name, start) DO UPDATE SET date = excluded.date, duration_min = excluded.duration_min, kcal = excluded.kcal";
+  "ON CONFLICT(name, start) DO UPDATE SET date = excluded.date, duration_min = excluded.duration_min, kcal = excluded.kcal, " +
+  "end_ts = COALESCE(excluded.end_ts, workouts.end_ts), source = COALESCE(excluded.source, workouts.source), " +
+  "detail = COALESCE(excluded.detail, workouts.detail)";
 
 export const INSERT_WORKOUTS_JSON =
-  "INSERT INTO workouts (name, start, date, duration_min, kcal) " +
+  "INSERT INTO workouts (name, start, date, duration_min, kcal, end_ts, source, detail) " +
   "SELECT json_extract(value, '$.n'), json_extract(value, '$.s'), json_extract(value, '$.d'), " +
-  "json_extract(value, '$.m'), json_extract(value, '$.k') " +
+  "json_extract(value, '$.m'), json_extract(value, '$.k'), json_extract(value, '$.e'), " +
+  "json_extract(value, '$.src'), json_extract(value, '$.detail') " +
   "FROM json_each(?) WHERE true " +
   "ON CONFLICT(name, start) DO NOTHING";
+
+export const UPSERT_SAMPLES_JSON =
+  "INSERT INTO samples (id, metric, ts, date, end_ts, qty, min_qty, max_qty, avg_qty, units, source, value, grain, extra, sig) " +
+  "SELECT json_extract(value, '$.id'), json_extract(value, '$.m'), json_extract(value, '$.ts'), json_extract(value, '$.d'), " +
+  "json_extract(value, '$.e'), json_extract(value, '$.q'), json_extract(value, '$.min'), json_extract(value, '$.max'), " +
+  "json_extract(value, '$.avg'), json_extract(value, '$.u'), json_extract(value, '$.src'), json_extract(value, '$.v'), " +
+  "json_extract(value, '$.g'), json_extract(value, '$.x'), json_extract(value, '$.sig') " +
+  "FROM json_each(?) WHERE true " +
+  "ON CONFLICT(id) DO UPDATE SET qty = excluded.qty, min_qty = excluded.min_qty, max_qty = excluded.max_qty, " +
+  "avg_qty = excluded.avg_qty, units = excluded.units, source = excluded.source, value = excluded.value, " +
+  "grain = excluded.grain, extra = excluded.extra, sig = excluded.sig, end_ts = excluded.end_ts";
+
+export const SAMPLE_SIGS_ON_DATES =
+  "SELECT id, sig FROM samples WHERE date IN (SELECT value FROM json_each(?))";
+
+export const SAMPLES_ON_DATES =
+  "SELECT id, metric, ts, date, end_ts, qty, min_qty, max_qty, avg_qty, units, source, value, grain, extra, sig FROM samples " +
+  "WHERE date IN (SELECT value FROM json_each(?))";
+
+export const SAMPLES_RANGE =
+  "SELECT id, metric, ts, date, end_ts, qty, min_qty, max_qty, avg_qty, units, source, value, grain, extra FROM samples " +
+  "WHERE metric = ? AND date >= ? AND date <= ? ORDER BY date, ts, id LIMIT ? OFFSET ?";
+
+export const UPSERT_SLEEP_JSON =
+  "INSERT INTO sleep_sessions (id, date, kind, start_ts, end_ts, in_bed_start, in_bed_end, total_hr, asleep_hr, in_bed_hr, " +
+  "core_hr, deep_hr, rem_hr, awake_hr, stage, source, sig) " +
+  "SELECT json_extract(value, '$.id'), json_extract(value, '$.d'), json_extract(value, '$.k'), json_extract(value, '$.s'), " +
+  "json_extract(value, '$.e'), json_extract(value, '$.ibs'), json_extract(value, '$.ibe'), json_extract(value, '$.total'), " +
+  "json_extract(value, '$.asleep'), json_extract(value, '$.bed'), json_extract(value, '$.core'), json_extract(value, '$.deep'), " +
+  "json_extract(value, '$.rem'), json_extract(value, '$.awake'), json_extract(value, '$.stage'), json_extract(value, '$.src'), " +
+  "json_extract(value, '$.sig') FROM json_each(?) WHERE true " +
+  "ON CONFLICT(id) DO UPDATE SET total_hr = excluded.total_hr, asleep_hr = excluded.asleep_hr, in_bed_hr = excluded.in_bed_hr, " +
+  "core_hr = excluded.core_hr, deep_hr = excluded.deep_hr, rem_hr = excluded.rem_hr, awake_hr = excluded.awake_hr, " +
+  "stage = excluded.stage, source = excluded.source, sig = excluded.sig, start_ts = excluded.start_ts, end_ts = excluded.end_ts";
+
+export const SLEEP_SIGS_ON_DATES =
+  "SELECT id, sig FROM sleep_sessions WHERE date IN (SELECT value FROM json_each(?))";
+
+export const SLEEP_RANGE =
+  "SELECT id, date, kind, start_ts, end_ts, in_bed_start, in_bed_end, total_hr, asleep_hr, in_bed_hr, core_hr, deep_hr, " +
+  "rem_hr, awake_hr, stage, source FROM sleep_sessions WHERE date >= ? AND date <= ? " +
+  "ORDER BY date, COALESCE(start_ts, in_bed_start, ''), id LIMIT ? OFFSET ?";
+
+export const UPSERT_RECORDS_JSON =
+  "INSERT INTO health_records (id, kind, ts, date, name, source, payload, sig) " +
+  "SELECT json_extract(value, '$.id'), json_extract(value, '$.k'), json_extract(value, '$.ts'), json_extract(value, '$.d'), " +
+  "json_extract(value, '$.n'), json_extract(value, '$.src'), json_extract(value, '$.p'), json_extract(value, '$.sig') " +
+  "FROM json_each(?) WHERE true " +
+  "ON CONFLICT(id) DO UPDATE SET ts = excluded.ts, name = excluded.name, source = excluded.source, " +
+  "payload = excluded.payload, sig = excluded.sig";
+
+export const RECORD_SIGS_ON_DATES =
+  "SELECT id, sig FROM health_records WHERE date IN (SELECT value FROM json_each(?))";
+
+export const RECORDS_RANGE =
+  "SELECT id, kind, ts, date, name, source, payload FROM health_records " +
+  "WHERE kind = ? AND date >= ? AND date <= ? ORDER BY date, COALESCE(ts, ''), id LIMIT ? OFFSET ?";
+
+export const WORKOUT_DETAILS_RANGE =
+  "SELECT name, start, date, duration_min, kcal, end_ts, source, detail FROM workouts " +
+  "WHERE date >= ? AND date <= ? ORDER BY date, start, name LIMIT ? OFFSET ?";
+
+export const COVERAGE_METRICS =
+  "SELECT 'metric' AS kind, metric AS name, MIN(date) AS min_date, MAX(date) AS max_date, COUNT(*) AS n FROM samples GROUP BY metric " +
+  "UNION ALL SELECT 'metric', metric, MIN(date), MAX(date), SUM(n) FROM points_daily " +
+  "WHERE metric NOT IN (SELECT DISTINCT metric FROM samples) GROUP BY metric";
+
+export const COVERAGE_SLEEP =
+  "SELECT 'sleep' AS kind, '' AS name, MIN(date) AS min_date, MAX(date) AS max_date, COUNT(*) AS n FROM sleep_sessions";
+
+export const COVERAGE_WORKOUTS =
+  "SELECT 'workout' AS kind, name, MIN(date) AS min_date, MAX(date) AS max_date, COUNT(*) AS n FROM workouts GROUP BY name";
+
+export const COVERAGE_RECORDS =
+  "SELECT kind, COALESCE(name, '') AS name, MIN(date) AS min_date, MAX(date) AS max_date, COUNT(*) AS n FROM health_records GROUP BY kind, name";
+
+export const POINTS_BETWEEN_DATES =
+  "SELECT date, metric, sum_qty, last_qty, last_ts, units, n FROM points_daily WHERE date >= ? AND date <= ? ORDER BY date, metric";
 
 /**
  * Non-Apple ingest data counts as already stored. Apple rows alone do not:

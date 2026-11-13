@@ -30,7 +30,7 @@ function request(body, headers = {}) {
 }
 
 function ctx(storage, extra = {}) {
-  return { token: "tok", timeZone: "UTC", storage, now: NOW, ...extra };
+  return { token: "tok", timeZone: "UTC", storage, now: NOW, ingestMaxAgeDays: 1, ...extra };
 }
 
 function steps(date, qty = 1) {
@@ -1044,7 +1044,7 @@ test("ingest projections match d1 when a hint is already stored", async () => {
   const points = aggregateDays(parsed.points, storedMetricSet());
   const json = await countedIngest(JSON.stringify(jsonBody));
   assert.equal(json.response.status, 200, JSON.stringify(await json.response.clone().json()));
-  assert.equal(json.counter.n, closedProjection(points, parsed.workouts));
+  assert.equal(json.counter.n, closedProjection(points, parsed.workouts) + 3);
   assert.equal(json.db.prepare("SELECT hint FROM export_hint WHERE id = 1").get(), undefined);
   json.db.close();
 
@@ -1073,7 +1073,7 @@ test("ingest projections match d1 when a hint is already stored", async () => {
   const quietPoints = aggregateDays(quietParsed.points, storedMetricSet());
   const unchanged = closedProjection(quietPoints, quietParsed.workouts, null);
   const changed = closedProjection(quietPoints, quietParsed.workouts, "stored hint");
-  assert.equal(quietCounter.n, unchanged);
+  assert.equal(quietCounter.n, unchanged + 3);
   assert.equal(changed, unchanged + 1);
   assert.equal(quietDb.prepare("SELECT COUNT(*) AS n FROM export_hint WHERE id = 1").get().n, 0);
   quietDb.close();

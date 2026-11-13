@@ -2,7 +2,9 @@ import pg from "pg";
 import { shouldStoreRaw } from "../core/aggregate.js";
 import { countNewDays, dateGroups, hintAction, MAX_INGEST_DATES, normalizeBackfill, partitionIngest, withExportHint } from "../core/ingest-guard.js";
 import { summarizeDay } from "../core/summary.js";
-import { ingestWriteChunks } from "./bulk.js";
+import { healthWriteChunks, ingestWriteChunks } from "./bulk.js";
+import { bindHealthReads } from "./health-read.js";
+import { pointsAfterSamples, rowsToWrite, uniqueDates } from "../core/health-rows.js";
 import { migrationFiles, statementsForPostgres } from "./migrate.js";
 import {
   DELETE_HINT,
@@ -44,24 +46,59 @@ const REPLACE_POINTS_JSON =
   "last_ts = excluded.last_ts, units = excluded.units, n = excluded.n";
 
 const UPSERT_WORKOUTS_JSON =
-  "INSERT INTO workouts (name, start, date, duration_min, kcal) " +
-  "SELECT r.n, r.s, r.d, r.m, r.k FROM jsonb_to_recordset(?::jsonb) " +
-  "AS r(n text, s text, d text, m float8, k float8) " +
-  "ON CONFLICT(name, start) DO UPDATE SET date = excluded.date, duration_min = excluded.duration_min, kcal = excluded.kcal";
+  "INSERT INTO workouts (name, start, date, duration_min, kcal, end_ts, source, detail) " +
+  "SELECT r.n, r.s, r.d, r.m, r.k, r.e, r.src, r.detail FROM jsonb_to_recordset(?::jsonb) " +
+  "AS r(n text, s text, d text, m float8, k float8, e text, src text, detail text) " +
+  "ON CONFLICT(name, start) DO UPDATE SET date = excluded.date, duration_min = excluded.duration_min, kcal = excluded.kcal, " +
+  "end_ts = COALESCE(excluded.end_ts, workouts.end_ts), source = COALESCE(excluded.source, workouts.source), " +
+  "detail = COALESCE(excluded.detail, workouts.detail)";
 
 const POINTS_ON_DATES =
   "SELECT date, metric, sum_qty, last_qty, last_ts, units, n FROM points_daily " +
   "WHERE date IN (SELECT value FROM jsonb_array_elements_text(?::jsonb))";
 
 const WORKOUTS_ON_DATES =
-  "SELECT name, start, date, duration_min, kcal FROM workouts " +
+  "SELECT name, start, date, duration_min, kcal, end_ts, source, detail FROM workouts " +
   "WHERE date IN (SELECT value FROM jsonb_array_elements_text(?::jsonb))";
 
 const INSERT_WORKOUTS_JSON =
-  "INSERT INTO workouts (name, start, date, duration_min, kcal) " +
-  "SELECT r.n, r.s, r.d, r.m, r.k FROM jsonb_to_recordset(?::jsonb) " +
-  "AS r(n text, s text, d text, m float8, k float8) " +
+  "INSERT INTO workouts (name, start, date, duration_min, kcal, end_ts, source, detail) " +
+  "SELECT r.n, r.s, r.d, r.m, r.k, r.e, r.src, r.detail FROM jsonb_to_recordset(?::jsonb) " +
+  "AS r(n text, s text, d text, m float8, k float8, e text, src text, detail text) " +
   "ON CONFLICT(name, start) DO NOTHING";
+
+const UPSERT_SAMPLES_JSON =
+  "INSERT INTO samples (id, metric, ts, date, end_ts, qty, min_qty, max_qty, avg_qty, units, source, value, grain, extra, sig) " +
+  "SELECT r.id, r.m, r.ts, r.d, r.e, r.q, r.min, r.max, r.avg, r.u, r.src, r.v, r.g, r.x, r.sig " +
+  "FROM jsonb_to_recordset(?::jsonb) AS r(id text, m text, ts text, d text, e text, q float8, min float8, max float8, avg float8, u text, src text, v text, g text, x text, sig text) " +
+  "ON CONFLICT(id) DO UPDATE SET qty = excluded.qty, min_qty = excluded.min_qty, max_qty = excluded.max_qty, " +
+  "avg_qty = excluded.avg_qty, units = excluded.units, source = excluded.source, value = excluded.value, " +
+  "grain = excluded.grain, extra = excluded.extra, sig = excluded.sig, end_ts = excluded.end_ts";
+
+const UPSERT_SLEEP_JSON =
+  "INSERT INTO sleep_sessions (id, date, kind, start_ts, end_ts, in_bed_start, in_bed_end, total_hr, asleep_hr, in_bed_hr, " +
+  "core_hr, deep_hr, rem_hr, awake_hr, stage, source, sig) " +
+  "SELECT r.id, r.d, r.k, r.s, r.e, r.ibs, r.ibe, r.total, r.asleep, r.bed, r.core, r.deep, r.rem, r.awake, r.stage, r.src, r.sig " +
+  "FROM jsonb_to_recordset(?::jsonb) AS r(id text, d text, k text, s text, e text, ibs text, ibe text, total float8, asleep float8, bed float8, core float8, deep float8, rem float8, awake float8, stage text, src text, sig text) " +
+  "ON CONFLICT(id) DO UPDATE SET total_hr = excluded.total_hr, asleep_hr = excluded.asleep_hr, in_bed_hr = excluded.in_bed_hr, " +
+  "core_hr = excluded.core_hr, deep_hr = excluded.deep_hr, rem_hr = excluded.rem_hr, awake_hr = excluded.awake_hr, " +
+  "stage = excluded.stage, source = excluded.source, sig = excluded.sig, start_ts = excluded.start_ts, end_ts = excluded.end_ts";
+
+const UPSERT_RECORDS_JSON =
+  "INSERT INTO health_records (id, kind, ts, date, name, source, payload, sig) " +
+  "SELECT r.id, r.k, r.ts, r.d, r.n, r.src, r.p, r.sig FROM jsonb_to_recordset(?::jsonb) " +
+  "AS r(id text, k text, ts text, d text, n text, src text, p text, sig text) " +
+  "ON CONFLICT(id) DO UPDATE SET ts = excluded.ts, name = excluded.name, source = excluded.source, payload = excluded.payload, sig = excluded.sig";
+
+const SIGS_ON_DATES = {
+  samples: "SELECT id, sig FROM samples WHERE date IN (SELECT value FROM jsonb_array_elements_text(?::jsonb))",
+  sleep: "SELECT id, sig FROM sleep_sessions WHERE date IN (SELECT value FROM jsonb_array_elements_text(?::jsonb))",
+  records: "SELECT id, sig FROM health_records WHERE date IN (SELECT value FROM jsonb_array_elements_text(?::jsonb))",
+};
+
+const SAMPLES_ON_DATES =
+  "SELECT id, metric, ts, date, end_ts, qty, min_qty, max_qty, avg_qty, units, source, value, grain, extra, sig FROM samples " +
+  "WHERE date IN (SELECT value FROM jsonb_array_elements_text(?::jsonb))";
 
 const { Pool } = pg;
 
@@ -221,10 +258,39 @@ export function createPostgresStorageFromPool(pool) {
     },
     async insertIngest(batch, options = {}) {
       const client = options.client || null;
-      const dates = [...new Set([...(batch.points || []).map((point) => point.date), ...(batch.workouts || []).map((workout) => workout.date)])];
+      const sampleRows = batch.sampleRows || [];
+      const sleepRows = batch.sleepRows || [];
+      const recordRows = batch.recordRows || [];
+      const healthDates = uniqueDates([...sampleRows, ...sleepRows, ...recordRows]);
+      const healthJson = JSON.stringify(healthDates);
+      let points = batch.points || [];
+      const runJson = async (sql, rows, kind) => {
+        const existing = rows.length
+          ? (await this.query(client, toPostgres(SIGS_ON_DATES[kind]), [healthJson])).rows
+          : [];
+        const writes = rowsToWrite(existing, rows);
+        const chunks = healthWriteChunks(
+          kind === "samples" ? writes : [],
+          kind === "sleep" ? writes : [],
+          kind === "records" ? writes : [],
+        )[kind];
+        for (const chunk of chunks) await this.query(client, toPostgres(sql), [chunk]);
+      };
+      if (sampleRows.length) {
+        await runJson(UPSERT_SAMPLES_JSON, sampleRows, "samples");
+        const storedSamples = (await this.query(client, toPostgres(SAMPLES_ON_DATES), [healthJson])).rows;
+        points = pointsAfterSamples(points, sampleRows, storedSamples);
+      }
+      if (sleepRows.length) await runJson(UPSERT_SLEEP_JSON, sleepRows, "sleep");
+      if (recordRows.length) await runJson(UPSERT_RECORDS_JSON, recordRows, "records");
+      const dates = [...new Set([
+        ...points.map((point) => point.date),
+        ...(batch.workouts || []).map((workout) => workout.date),
+        ...healthDates,
+      ])];
       const stored = await this.loadStored(dates, client);
-      const diff = partitionIngest(batch.points, batch.workouts, stored);
-      const newDays = countNewDays(batch.points, batch.workouts, stored);
+      const diff = partitionIngest(points, batch.workouts, stored);
+      const newDays = countNewDays(points, batch.workouts, stored);
       let action = "skip";
       if (options.hint !== undefined) {
         const current = options.hintKnown ? options.knownHint ?? null : await this.readExportHint(client);
@@ -285,6 +351,10 @@ export function createPostgresStorageFromPool(pool) {
       const result = await pool.query(toPostgres(WORKOUTS_RANGE), [startDate, endDate]);
       return result.rows;
     },
+    ...bindHealthReads(async (sql, ...params) => {
+      const result = await pool.query(toPostgres(sql), params);
+      return result.rows;
+    }),
     async close() {
       await pool.end();
     },

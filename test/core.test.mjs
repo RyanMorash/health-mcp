@@ -237,7 +237,7 @@ test("allowlist stores extra metrics and raw storage can be turned off", async (
   assert.equal(storedMetricSet("heart_rate, heart_rate").has("heart_rate"), true);
 });
 
-test("a partial re-send leaves the full-day total unchanged", async () => {
+test("a partial re-send updates that sample and keeps the other samples", async () => {
   const storage = new MemoryStorage();
   const ctx = { token: "tok", storage, now: new Date("2026-10-16T12:00:00Z"), ...fixtureIngest };
   const full = {
@@ -267,7 +267,7 @@ test("a partial re-send leaves the full-day total unchanged", async () => {
   const again = await handleRequest(request("/ingest", { method: "POST", body: JSON.stringify(partial) }), ctx);
   assert.equal(again.status, 200);
   const summary = await (await handleRequest(request("/summary?date=2026-10-14"), ctx)).json();
-  assert.equal(summary.steps, 6000);
+  assert.equal(summary.steps, 5005);
   assert.equal(summary.dietary_kcal, 400);
   assert.equal(storage.points.get("2026-10-14\0step_count").n, 3);
 });

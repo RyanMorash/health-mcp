@@ -4,10 +4,14 @@ import Database from "better-sqlite3";
 import { shouldStoreRaw } from "../core/aggregate.js";
 import { countNewDays, dateGroups, hintAction, MAX_INGEST_DATES, normalizeBackfill, partitionIngest, withExportHint } from "../core/ingest-guard.js";
 import { summarizeDay } from "../core/summary.js";
-import { ingestWriteChunks } from "./bulk.js";
+import { healthWriteChunks, ingestWriteChunks } from "./bulk.js";
+import { bindHealthReads } from "./health-read.js";
+import { pointsAfterSamples, rowsToWrite, uniqueDates } from "../core/health-rows.js";
 import { migrationFiles, statementsForSqlite } from "./migrate.js";
 import { INSERT_RAW, LIST_METRICS, METRIC_RANGE, POINTS_FOR_DATE, POINTS_ON_DATES,
   UPSERT_POINTS_JSON, REPLACE_POINTS_JSON, UPSERT_WORKOUTS_JSON, INSERT_WORKOUTS_JSON,
+  UPSERT_SAMPLES_JSON, SAMPLE_SIGS_ON_DATES, SAMPLES_ON_DATES,
+  UPSERT_SLEEP_JSON, SLEEP_SIGS_ON_DATES, UPSERT_RECORDS_JSON, RECORD_SIGS_ON_DATES,
   WORKOUTS_FOR_DATE, WORKOUTS_ON_DATES, WORKOUTS_RANGE, CLAIM_QUOTA, READ_HINT, UPSERT_HINT, DELETE_HINT,
   READ_BACKFILL, RESERVE_BACKFILL, RELEASE_BACKFILL, DELETE_EMPTY_BACKFILL, FINISH_BACKFILL, CLOSE_BACKFILL, SEAL_BACKFILL_IF_MISSING, HAS_STORED_DATA,
   APPLE_MARKER_ID, INGEST_MARKER_ID, READ_MARKER, MARK_ORIGIN } from "./statements.js";
@@ -60,6 +64,13 @@ export function createSqliteStorage(filename) {
   const replacePointsJson = db.prepare(REPLACE_POINTS_JSON);
   const upsertWorkoutsJson = db.prepare(UPSERT_WORKOUTS_JSON);
   const insertWorkoutsJson = db.prepare(INSERT_WORKOUTS_JSON);
+  const upsertSamplesJson = db.prepare(UPSERT_SAMPLES_JSON);
+  const sampleSigs = db.prepare(SAMPLE_SIGS_ON_DATES);
+  const samplesOnDates = db.prepare(SAMPLES_ON_DATES);
+  const upsertSleepJson = db.prepare(UPSERT_SLEEP_JSON);
+  const sleepSigs = db.prepare(SLEEP_SIGS_ON_DATES);
+  const upsertRecordsJson = db.prepare(UPSERT_RECORDS_JSON);
+  const recordSigs = db.prepare(RECORD_SIGS_ON_DATES);
   const loadSpan = (dates) => {
     const points = [];
     const workouts = [];
@@ -73,10 +84,33 @@ export function createSqliteStorage(filename) {
   const readMarker = db.prepare(READ_MARKER);
   const markOrigin = db.prepare(MARK_ORIGIN);
   const insertAll = db.transaction((batch, options = {}) => {
-    const dates = [...new Set([...(batch.points || []).map((point) => point.date), ...(batch.workouts || []).map((workout) => workout.date)])];
+    const sampleRows = batch.sampleRows || [];
+    const sleepRows = batch.sleepRows || [];
+    const recordRows = batch.recordRows || [];
+    const healthDates = uniqueDates([...sampleRows, ...sleepRows, ...recordRows]);
+    const healthJson = JSON.stringify(healthDates);
+    let points = batch.points || [];
+    if (sampleRows.length) {
+      const writes = rowsToWrite(sampleSigs.all(healthJson), sampleRows);
+      for (const chunk of healthWriteChunks(writes, [], []).samples) upsertSamplesJson.run(chunk);
+      points = pointsAfterSamples(points, sampleRows, samplesOnDates.all(healthJson));
+    }
+    if (sleepRows.length) {
+      const writes = rowsToWrite(sleepSigs.all(healthJson), sleepRows);
+      for (const chunk of healthWriteChunks([], writes, []).sleep) upsertSleepJson.run(chunk);
+    }
+    if (recordRows.length) {
+      const writes = rowsToWrite(recordSigs.all(healthJson), recordRows);
+      for (const chunk of healthWriteChunks([], [], writes).records) upsertRecordsJson.run(chunk);
+    }
+    const dates = [...new Set([
+      ...points.map((point) => point.date),
+      ...(batch.workouts || []).map((workout) => workout.date),
+      ...healthDates,
+    ])];
     const stored = loadSpan(dates);
-    const diff = partitionIngest(batch.points, batch.workouts, stored);
-    const newDays = countNewDays(batch.points, batch.workouts, stored);
+    const diff = partitionIngest(points, batch.workouts, stored);
+    const newDays = countNewDays(points, batch.workouts, stored);
     if (options.markOrigin) {
       const markerId = options.markOrigin === "apple" ? APPLE_MARKER_ID : INGEST_MARKER_ID;
       if (!readMarker.get(markerId)) markOrigin.run(markerId);
@@ -175,6 +209,7 @@ export function createSqliteStorage(filename) {
     async listWorkouts(startDate, endDate) {
       return workoutsRange.all(startDate, endDate);
     },
+    ...bindHealthReads((sql, ...params) => db.prepare(sql).all(...params)),
     async close() {
       db.close();
     },

@@ -30,7 +30,7 @@ function request(pathname, { method = "POST", token = "tok", body, headers = {} 
 }
 
 function ctx(storage, extra = {}) {
-  return { token: "tok", timeZone: "UTC", storage, now: NOW, ...extra };
+  return { token: "tok", timeZone: "UTC", storage, now: NOW, ingestMaxAgeDays: 1, ...extra };
 }
 
 function steps(date, qty = 10) {

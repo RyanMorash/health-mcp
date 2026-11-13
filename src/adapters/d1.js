@@ -2,7 +2,9 @@ import { shouldStoreRaw } from "../core/aggregate.js";
 import { D1DailyLimitError, d1DailyLimitKind } from "../core/free-tier.js";
 import { countNewDays, dateGroups, hintAction, MAX_INGEST_DATES, normalizeBackfill, partitionIngest, resolveMaxStatements, withExportHint } from "../core/ingest-guard.js";
 import { summarizeDay } from "../core/summary.js";
-import { ingestWriteChunks } from "./bulk.js";
+import { healthWriteChunks, ingestWriteChunks } from "./bulk.js";
+import { bindHealthReads } from "./health-read.js";
+import { pointsAfterSamples, rowsToWrite, uniqueDates } from "../core/health-rows.js";
 import { addedColumn, migrationFiles } from "./migrate.js";
 import {
   D1_BATCH_LIMIT,
@@ -32,6 +34,13 @@ import {
   UPSERT_HINT,
   UPSERT_POINTS_JSON,
   UPSERT_WORKOUTS_JSON,
+  UPSERT_SAMPLES_JSON,
+  SAMPLE_SIGS_ON_DATES,
+  SAMPLES_ON_DATES,
+  UPSERT_SLEEP_JSON,
+  SLEEP_SIGS_ON_DATES,
+  UPSERT_RECORDS_JSON,
+  RECORD_SIGS_ON_DATES,
   WORKOUTS_FOR_DATE,
   WORKOUTS_ON_DATES,
   WORKOUTS_RANGE,
@@ -50,6 +59,7 @@ import {
 export class D1Storage {
   constructor(db) {
     this.db = db;
+    Object.assign(this, bindHealthReads((sql, ...params) => this.rowsFor(sql, ...params)));
   }
 
   /** D1 is the only adapter with a statement budget. The ceiling is 45. */
@@ -178,10 +188,46 @@ export class D1Storage {
   }
 
   async insertIngest(batch, options = {}) {
-    const dates = [...new Set([...(batch.points || []).map((point) => point.date), ...(batch.workouts || []).map((workout) => workout.date)])];
+    const sampleRows = batch.sampleRows || [];
+    const sleepRows = batch.sleepRows || [];
+    const recordRows = batch.recordRows || [];
+    const healthDates = uniqueDates([...sampleRows, ...sleepRows, ...recordRows]);
+    const healthJson = JSON.stringify(healthDates);
+    let points = batch.points || [];
+    const healthStatements = [];
+    if (sampleRows.length) {
+      const writes = rowsToWrite(await this.rowsFor(SAMPLE_SIGS_ON_DATES, healthJson), sampleRows);
+      for (const chunk of healthWriteChunks(writes, [], []).samples) {
+        healthStatements.push(this.db.prepare(UPSERT_SAMPLES_JSON).bind(chunk));
+      }
+    }
+    if (sleepRows.length) {
+      const writes = rowsToWrite(await this.rowsFor(SLEEP_SIGS_ON_DATES, healthJson), sleepRows);
+      for (const chunk of healthWriteChunks([], writes, []).sleep) {
+        healthStatements.push(this.db.prepare(UPSERT_SLEEP_JSON).bind(chunk));
+      }
+    }
+    if (recordRows.length) {
+      const writes = rowsToWrite(await this.rowsFor(RECORD_SIGS_ON_DATES, healthJson), recordRows);
+      for (const chunk of healthWriteChunks([], [], writes).records) {
+        healthStatements.push(this.db.prepare(UPSERT_RECORDS_JSON).bind(chunk));
+      }
+    }
+    for (let i = 0; i < healthStatements.length; i += D1_BATCH_LIMIT) {
+      const chunk = healthStatements.slice(i, i + D1_BATCH_LIMIT);
+      if (chunk.length) await this.run(() => this.db.batch(chunk));
+    }
+    if (sampleRows.length) {
+      points = pointsAfterSamples(points, sampleRows, await this.rowsFor(SAMPLES_ON_DATES, healthJson));
+    }
+    const dates = [...new Set([
+      ...points.map((point) => point.date),
+      ...(batch.workouts || []).map((workout) => workout.date),
+      ...healthDates,
+    ])];
     const stored = await this.loadStored(dates);
-    const diff = partitionIngest(batch.points, batch.workouts, stored);
-    const newDays = countNewDays(batch.points, batch.workouts, stored);
+    const diff = partitionIngest(points, batch.workouts, stored);
+    const newDays = countNewDays(points, batch.workouts, stored);
     const chunks = ingestWriteChunks(diff.points, diff.workouts);
     const statements = [];
     if (options.markOrigin) {

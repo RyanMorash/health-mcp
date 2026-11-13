@@ -1,4 +1,4 @@
-export { ingestWriteChunks, jsonChunks, pointJson, workoutJson } from "../core/bulk.js";
+export { healthWriteChunks, ingestWriteChunks, jsonChunks, pointJson, workoutJson } from "../core/bulk.js";
 
 export function dateSpan(dates) {
   if (!dates.length) return null;

@@ -25,6 +25,7 @@ test("migration SQL stays portable", () => {
     "0004_ingest_backfill.sql",
     "0005_quota_window_bigint.sql",
     "0006_ingest_backfill_deadline.sql",
+    "0007_full_health.sql",
   ]);
   assert.match(files[2].sql, /window_start INTEGER NOT NULL/);
   assert.doesNotMatch(files[2].sql, /BIGINT/);

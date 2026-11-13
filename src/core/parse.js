@@ -1,61 +1,23 @@
+import { localDate } from "./dates.js";
+import { haeArrayError, haeData, readingFromMetric, recordsFrom, sleepFromMetric, workoutMeta } from "./hae.js";
 import { DEFAULT_TIME_ZONE, ENERGY_METRICS } from "./metrics.js";
 
-// "2026-10-15 07:00:00 -0700" or ISO. Offset-bearing Health Auto Export
-// timestamps keep the calendar date in the string. Everything else is
-// formatted in `timeZone`.
-const OFFSET_RE = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\s*([+-]\d{2}):?(\d{2}))?/;
-
-export function localDate(value, timeZone = DEFAULT_TIME_ZONE) {
-  if (!value) return null;
-  const text = String(value);
-  const match = text.match(OFFSET_RE);
-  if (match && match[3]) return match[1];
-  const date = new Date(text);
-  if (Number.isNaN(date.getTime())) {
-    return /^\d{4}-\d{2}-\d{2}/.test(text) ? text.slice(0, 10) : null;
-  }
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: timeZone || DEFAULT_TIME_ZONE,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(date);
-}
+export { localDate } from "./dates.js";
 
 function isPlainObject(value) {
   return value != null && typeof value === "object" && !Array.isArray(value);
 }
 
 /**
- * Null when `body` is a Health Auto Export object with a metrics and/or
- * workouts array. Otherwise "invalid_payload".
+ * Null when `body` is a Health Auto Export object. Version 2 may contain
+ * metrics, workouts, symptoms, ECG, heart-rate notifications, state of mind,
+ * cycle tracking, or medications. A body that is already the `data` object
+ * is accepted too.
  */
 export function payloadError(body) {
   if (!isPlainObject(body)) return "invalid_payload";
   const data = Object.hasOwn(body, "data") ? body.data : body;
-  if (!isPlainObject(data)) return "invalid_payload";
-  const hasMetrics = Object.hasOwn(data, "metrics");
-  const hasWorkouts = Object.hasOwn(data, "workouts");
-  if (!hasMetrics && !hasWorkouts) return "invalid_payload";
-  if (hasMetrics && !Array.isArray(data.metrics)) return "invalid_payload";
-  if (hasWorkouts && !Array.isArray(data.workouts)) return "invalid_payload";
-  if (hasMetrics) {
-    for (const metric of data.metrics) {
-      if (!isPlainObject(metric)) return "invalid_payload";
-      if (metric.data != null && !Array.isArray(metric.data)) return "invalid_payload";
-      if (Array.isArray(metric.data)) {
-        for (const sample of metric.data) {
-          if (!isPlainObject(sample)) return "invalid_payload";
-        }
-      }
-    }
-  }
-  if (hasWorkouts) {
-    for (const workout of data.workouts) {
-      if (!isPlainObject(workout)) return "invalid_payload";
-    }
-  }
-  return null;
+  return haeArrayError(data);
 }
 
 function toKcal(qty, units) {
@@ -69,31 +31,43 @@ function num(value) {
 }
 
 /**
- * Parse a Health Auto Export v2 body (`{ data: { metrics, workouts } }`).
+ * Parse a Health Auto Export v2 body (`{ data: { metrics, workouts, ... } }`).
  * A body that is already the `data` object is accepted too.
+ * `points` and `workouts` keep the daily-summary shape. `samples`, `sleep`,
+ * `records`, and `workoutMetaRows` carry the rest of the document.
  * @param {unknown} body
  * @param {{ timeZone?: string }} [options]
  */
 export function parse(body, options = {}) {
   const timeZone = options.timeZone || DEFAULT_TIME_ZONE;
-  const data = body?.data ?? body;
+  const data = haeData(body);
   const points = [];
   const workouts = [];
+  const samples = [];
+  const sleep = [];
+  const workoutMetaRows = [];
 
   for (const metric of data?.metrics || []) {
     if (!isPlainObject(metric)) continue;
     const name = String(metric.name || "").toLowerCase();
     for (const sample of metric.data || []) {
       if (!isPlainObject(sample)) continue;
-      const ts = sample.date || sample.startDate;
+      const reading = readingFromMetric(metric, sample, timeZone);
+      const night = sleepFromMetric(metric, sample, timeZone);
+      if (reading) samples.push(reading);
+      if (night) sleep.push(night);
+      const ts = sample.date || sample.startDate || sample.start;
       let qty = num(sample.qty ?? sample.Avg ?? sample.avg);
-      if (!ts || qty == null) continue;
+      if (name === "sleep_analysis" && qty == null && sample.totalSleep != null) qty = num(sample.totalSleep);
+      if (name === "blood_pressure" && qty == null && sample.systolic != null) qty = num(sample.systolic);
+      if (!ts || qty == null || !reading) continue;
       let units = metric.units || null;
       if (ENERGY_METRICS.has(name)) {
         qty = toKcal(qty, units);
         units = "kcal";
       }
-      points.push({ metric: name, ts: String(ts), date: localDate(ts, timeZone), units, qty });
+      if (name === "sleep_analysis" && sample.totalSleep != null) units = units || "hr";
+      points.push({ metric: name, ts: String(ts), date: reading.date, units, qty });
     }
   }
 
@@ -115,10 +89,16 @@ export function parse(body, options = {}) {
       duration_min: duration == null ? null : Math.round(duration / 6) / 10,
       kcal: kcal == null ? null : Math.round(kcal),
     });
+    const meta = workoutMeta(workout);
+    if (meta) workoutMetaRows.push(meta);
   }
 
   return {
     points: points.filter((point) => point.date),
     workouts: workouts.filter((workout) => workout.date),
+    samples: samples.filter((sample) => sample.date),
+    sleep: sleep.filter((row) => row.date),
+    records: recordsFrom(data, timeZone),
+    workoutMetaRows,
   };
 }

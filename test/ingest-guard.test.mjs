@@ -24,7 +24,7 @@ function request(pathname, { method = "GET", token = "tok", body, headers = {} }
 }
 
 function ctx(storage = new MemoryStorage(), extra = {}) {
-  return { token: "tok", timeZone: "UTC", storage, now: NOW, ...extra };
+  return { token: "tok", timeZone: "UTC", storage, now: NOW, ingestMaxAgeDays: 1, ...extra };
 }
 
 function steps(date, qty = 10) {
@@ -72,7 +72,7 @@ test("recency keeps today and yesterday and counts older points as dropped_stale
       ],
     },
   };
-  const response = await postIngest(storage, body);
+  const response = await postIngest(storage, body, { ingestMaxAgeDays: 1 });
   assert.equal(response.status, 200);
   const payload = await response.json();
   assert.equal(payload.dropped_stale, 3);
@@ -103,7 +103,7 @@ test("recency uses the configured timezone and INGEST_MAX_AGE_DAYS", async () =>
         }],
       },
     }),
-  }), ctx(zoned, { timeZone: "America/Los_Angeles", now: new Date("2026-10-15T06:00:00Z") }));
+  }), ctx(zoned, { timeZone: "America/Los_Angeles", now: new Date("2026-10-15T06:00:00Z"), ingestMaxAgeDays: 1 }));
   assert.equal((await response.json()).dropped_stale, 1);
   assert.equal((await zoned.queryDaySummary("2026-10-14")).steps, 2);
   assert.equal((await zoned.queryDaySummary("2026-10-13")).steps, 3);
@@ -135,8 +135,8 @@ test("recency uses the configured timezone and INGEST_MAX_AGE_DAYS", async () =>
 
 test("apple health import keeps history that ingest drops", async () => {
   const storage = seal(new MemoryStorage());
-  const environment = ctx(storage);
-  const dropped = await postIngest(storage, steps("2020-01-02", 11));
+  const environment = ctx(storage, { ingestMaxAgeDays: 1 });
+  const dropped = await postIngest(storage, steps("2020-01-02", 11), { ingestMaxAgeDays: 1 });
   assert.equal(dropped.status, 422);
   const droppedBody = await dropped.json();
   assert.equal(droppedBody.error, "outside_window");
@@ -511,7 +511,7 @@ test("D1 repeat of the same day does not write, and an accepted post adds one qu
   const quiet = ctx(envStorage, { ingestRatePerHour: 0 });
   const first = await handleRequest(request("/ingest", { method: "POST", body: JSON.stringify(steps("2026-10-16", 20)) }), quiet);
   assert.equal((await first.json()).written, 1);
-  assert.equal(writes.n, 2);
+  assert.equal(writes.n, 3);
   const before = writes.n;
   const repeat = await handleRequest(request("/ingest", { method: "POST", body: JSON.stringify(steps("2026-10-16", 20)) }), quiet);
   const repeatBody = await repeat.json();
@@ -560,7 +560,8 @@ test("apple health chunk posts are not rate limited", async () => {
 test("a huge age does not drop today", async () => {
   assert.equal(resolveMaxAgeDays(200_000_000), MAX_INGEST_MAX_AGE_DAYS);
   assert.equal(resolveMaxAgeDays(0), 0);
-  assert.equal(resolveMaxAgeDays(-5), 1);
+  assert.equal(resolveMaxAgeDays(-5), null);
+  assert.equal(resolveMaxAgeDays(undefined), null);
   const storage = new MemoryStorage();
   const response = await postIngest(storage, steps("2026-10-16", 4), { ingestMaxAgeDays: 200_000_000 });
   const body = await response.json();

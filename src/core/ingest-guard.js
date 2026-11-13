@@ -2,17 +2,20 @@ import { ingestWriteChunks } from "./bulk.js";
 import { localDate } from "./parse.js";
 import { MAX_PAYLOAD_CHARS } from "./metrics.js";
 
-/** Today and yesterday in the configured timezone. */
-export const DEFAULT_INGEST_MAX_AGE_DAYS = 1;
+/**
+ * No age cap. Set INGEST_MAX_AGE_DAYS to a non-negative integer to keep only
+ * that many days before today. `0` keeps today.
+ */
+export const DEFAULT_INGEST_MAX_AGE_DAYS = null;
 
 /** About 100 years. Larger values make the calendar cutoff invalid. */
 export const MAX_INGEST_MAX_AGE_DAYS = 36500;
 
 /** JSON ingest bodies larger than this are rejected. Apple Health import is separate. */
-export const DEFAULT_INGEST_MAX_BODY_BYTES = 1_000_000;
+export const DEFAULT_INGEST_MAX_BODY_BYTES = 5_000_000;
 
 /** Accepted posts per token per UTC hour. Zero disables the limit. */
-export const DEFAULT_INGEST_RATE_PER_HOUR = 6;
+export const DEFAULT_INGEST_RATE_PER_HOUR = 2_000;
 
 /** Per-request cap while the initial import window is open. */
 export const DEFAULT_INGEST_BACKFILL_MAX_BYTES = 5_000_000;
@@ -44,7 +47,7 @@ export const INGEST_MIN_DATE_FLOOR = "1970-01-01";
 const SEEDED_CLOSE_AT = "1970-01-01T00:00:00.000Z";
 
 /** Accepted posts per token per UTC hour while the initial import window is open. */
-export const DEFAULT_INGEST_BACKFILL_MAX_PER_HOUR = 60;
+export const DEFAULT_INGEST_BACKFILL_MAX_PER_HOUR = 5_000;
 
 /** Upper bound for a malformed import-window hourly cap. */
 export const MAX_INGEST_BACKFILL_MAX_PER_HOUR = 10_000;
@@ -122,8 +125,9 @@ function configuredInteger(value) {
 }
 
 export function resolveMaxAgeDays(value) {
+  if (value == null || (typeof value === "string" && value.trim() === "")) return null;
   const parsed = configuredInteger(value);
-  if (parsed == null || parsed < 0) return DEFAULT_INGEST_MAX_AGE_DAYS;
+  if (parsed == null || parsed < 0) return null;
   return Math.min(parsed, MAX_INGEST_MAX_AGE_DAYS);
 }
 
@@ -428,54 +432,77 @@ export function beforeMinDateBody(minDate) {
 
 /**
  * Keep points and workouts from today minus `maxAgeDays` through today plus
- * `FUTURE_SKEW_DAYS`. `dropped_stale` and `dropped_future` count dated samples
- * and workouts left out on each side.
+ * `FUTURE_SKEW_DAYS`. `maxAgeDays` null keeps every date on or after the
+ * minimum. `dropped_stale` and `dropped_future` count dated samples and
+ * workouts left out on each side.
  */
 function isIsoDate(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(value || "");
 }
 
-export function filterRecent(points, workouts, { now, timeZone, maxAgeDays, keepPast = false, minDate = DEFAULT_INGEST_MIN_DATE }) {
+export function recencyBounds({ now, timeZone, maxAgeDays, keepPast = false, minDate = DEFAULT_INGEST_MIN_DATE }) {
   const today = localDate(now.toISOString(), timeZone);
-  const cutoff = keepPast ? today : shiftIsoDate(today, -maxAgeDays);
+  const unlimited = maxAgeDays == null || keepPast;
+  const cutoff = unlimited ? today : shiftIsoDate(today, -maxAgeDays);
   const future = shiftIsoDate(today, FUTURE_SKEW_DAYS);
   const earliest = isIsoDate(minDate) ? minDate : DEFAULT_INGEST_MIN_DATE;
-  if ((!keepPast && !isIsoDate(cutoff)) || !isIsoDate(future)) {
+  return {
+    today,
+    cutoff,
+    future,
+    earliest,
+    unlimited,
+    valid: Boolean(today) && isIsoDate(future) && (unlimited || isIsoDate(cutoff)),
+  };
+}
+
+/** `keep`, `early`, `future`, or `stale`. Invalid bounds keep the row. */
+export function dateFate(date, bounds) {
+  if (!bounds?.valid) return "keep";
+  if (!date || date < bounds.earliest) return "early";
+  if (date > bounds.future) return "future";
+  if (!bounds.unlimited && date < bounds.cutoff) return "stale";
+  return "keep";
+}
+
+export function filterDated(rows, bounds) {
+  const kept = [];
+  let droppedStale = 0;
+  let droppedFuture = 0;
+  let droppedEarly = 0;
+  for (const row of rows || []) {
+    const fate = dateFate(row?.date, bounds);
+    if (fate === "early") droppedEarly += 1;
+    else if (fate === "future") droppedFuture += 1;
+    else if (fate === "stale") droppedStale += 1;
+    else kept.push(row);
+  }
+  return { kept, dropped_stale: droppedStale, dropped_future: droppedFuture, dropped_early: droppedEarly };
+}
+
+export function filterRecent(points, workouts, options) {
+  const bounds = recencyBounds(options);
+  if (!bounds.valid) {
     return {
       points: points || [],
       workouts: workouts || [],
       dropped_stale: 0,
       dropped_future: 0,
       dropped_early: 0,
-      cutoff,
-      today,
+      cutoff: bounds.cutoff,
+      today: bounds.today,
     };
   }
-  const keptPoints = [];
-  const keptWorkouts = [];
-  let droppedStale = 0;
-  let droppedFuture = 0;
-  let droppedEarly = 0;
-  for (const point of points || []) {
-    if (point.date < earliest) droppedEarly += 1;
-    else if (point.date > future) droppedFuture += 1;
-    else if (!keepPast && point.date < cutoff) droppedStale += 1;
-    else keptPoints.push(point);
-  }
-  for (const workout of workouts || []) {
-    if (workout.date < earliest) droppedEarly += 1;
-    else if (workout.date > future) droppedFuture += 1;
-    else if (!keepPast && workout.date < cutoff) droppedStale += 1;
-    else keptWorkouts.push(workout);
-  }
+  const keptPoints = filterDated(points, bounds);
+  const keptWorkouts = filterDated(workouts, bounds);
   return {
-    points: keptPoints,
-    workouts: keptWorkouts,
-    dropped_stale: droppedStale,
-    dropped_future: droppedFuture,
-    dropped_early: droppedEarly,
-    cutoff,
-    today,
+    points: keptPoints.kept,
+    workouts: keptWorkouts.kept,
+    dropped_stale: keptPoints.dropped_stale + keptWorkouts.dropped_stale,
+    dropped_future: keptPoints.dropped_future + keptWorkouts.dropped_future,
+    dropped_early: keptPoints.dropped_early + keptWorkouts.dropped_early,
+    cutoff: bounds.cutoff,
+    today: bounds.today,
   };
 }
 
@@ -497,11 +524,16 @@ function samePoint(prev, next) {
 
 function sameWorkout(prev, next) {
   const dateOk = prev.date == null || prev.date === next.date;
-  return dateOk
+  const core = dateOk
     && String(prev.name) === String(next.name)
     && String(prev.start) === String(next.start)
     && numEq(prev.duration_min, next.duration_min)
     && numEq(prev.kcal, next.kcal);
+  if (!core) return false;
+  if (next.end_ts !== undefined && String(prev.end_ts ?? "") !== String(next.end_ts ?? "")) return false;
+  if (next.source !== undefined && String(prev.source ?? "") !== String(next.source ?? "")) return false;
+  if (next.detail !== undefined && String(prev.detail ?? "") !== String(next.detail ?? "")) return false;
+  return true;
 }
 
 /**

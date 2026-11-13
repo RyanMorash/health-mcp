@@ -15,7 +15,7 @@ Not medical advice. See [Disclaimer](#disclaimer).
 ## How it works
 
 - **Your phone app sends your data.** An export app on your phone (HC Webhook or Life Dashboard Companion on Android, Apple Shortcuts on iPhone, built in with no extra app) posts your health data to your server.
-- **Your server keeps it.** health-mcp stores one row per metric per day in a database that you control.
+- **Your server keeps it.** health-mcp stores each Health Auto Export reading, plus one daily row per metric for fast summaries, in a database that you control.
 - **Your chatbot connects.** You add your server to your chatbot as an MCP connector. It can read your data, but never change it.
 
 ## Quick start
@@ -54,7 +54,7 @@ Then create the database tables. Do this **before** you deploy:
 node src/cli/d1-migrate.js --remote
 ```
 
-✅ **Checkpoint:** the command prints `0001_init.sql` through `0006_ingest_backfill_deadline.sql`, with no error. `--remote` or `--local` is required.
+✅ **Checkpoint:** the command prints `0001_init.sql` through `0007_full_health.sql`, with no error. `--remote` or `--local` is required. On a database that already ran `0001` through `0006`, this applies only `0007_full_health.sql`.
 
 Prefer your own machine, a VPS, or Docker? See [Self-hosting](https://github.com/Airbloomer/health-mcp/blob/main/docs/self-hosting.md) for the Node.js and Docker options (SQLite or Postgres).
 
@@ -162,7 +162,7 @@ Add a remote MCP server with the URL and header above. A Cursor `mcp.json` examp
 
 </details>
 
-✅ **Checkpoint:** the connector shows four tools: `get_daily_summary`, `get_metric`, `list_metrics`, and `list_workouts`.
+✅ **Checkpoint:** the connector shows these read-only tools: `get_daily_summary`, `get_metric`, `list_metrics`, `list_coverage`, `get_sleep`, `get_records`, `get_workout`, `summarize_dates`, `export_health`, and `list_workouts`.
 
 ### 5. Try it
 
@@ -177,32 +177,74 @@ Your data appears only after the phone app's first sync. The sleep question work
 
 ✅ **Checkpoint:** the chatbot calls a health-mcp tool and answers with your numbers.
 
-## Recommended export settings
+## Data model
 
-Health Auto Export should post recent days, not a full history and not today alone. Create two REST API automations (the app allows one data type each) that both post to `https://<your-host>/ingest` with the header `Authorization: Bearer <HEALTH_INGEST_TOKEN>`.
+Health Auto Export Version 2 JSON is stored as it arrives. There is no metric allowlist unless `HEALTH_METRIC_ALLOWLIST` is set. A metric the server has not seen before is stored with the same shape as steps or heart rate.
 
-- **Format:** JSON, export version 2.
-- **Metrics:** Dietary Energy, Protein, Carbohydrates, Total Fat, Active Energy, Basal Energy Burned, Step Count, Weight, and Body Fat Percentage. Use one total per metric per day, not hourly buckets.
-- **Date range:** today and yesterday. Yesterday is the finished day. Today is the running total, sent again as the day fills in. A range of today only never sends yesterday's finished total. After the initial import window closes, points older than yesterday are dropped (`INGEST_MAX_AGE_DAYS`, default `1`, counted in the configured time zone). A date more than one day ahead is dropped too. Dates before `INGEST_MIN_DATE` (default `2000-01-01`) are dropped as well.
-- **Schedule:** a few times a day, not every hour. The two automations share one token, and each run is a post. The default limit is 6 accepted posts per token per hour (`INGEST_RATE_LIMIT_PER_HOUR`).
-- **Workouts:** a second automation with the same URL, header, format, version, and date range. Leave route and per-second workout metrics off.
-- **Batch requests:** leave them off, so one day is not split across posts.
+| Table | What it holds |
+| --- | --- |
+| `samples` | One row per metric reading: timestamp, end, quantity, min/avg/max, units, source, and any extra fields (food name, meal time, systolic/diastolic, and so on). |
+| `points_daily` | One row per metric per calendar day, derived from the stored samples, for `GET /summary` and day/week/month queries. Raw readings win over summarized buckets, and those win over a single all-day total. |
+| `sleep_sessions` | Sleep summaries (stage hours, in-bed and asleep intervals) and individual stage segments. |
+| `workouts` | Name, start, duration, and active energy, plus end, source, and a JSON `detail` document (heart rate, route, metadata) when the export includes them. A detail larger than about 48 KB is trimmed and marked `truncated`. |
+| `health_records` | Symptoms, ECG, heart rate notifications, state of mind, cycle tracking, and medications. The original object is kept in `payload`. An ECG voltage series that does not fit is shortened and marked `voltageTruncated`. |
 
-A one-time full history can be posted here during the initial import window, or at any time on `POST /import/apple-health`. Import that history in chunks of 5 MB or less. An Apple Health import is stored in batches of at most 366 dates, and it is not rejected because of the date count. That import does not open, close, or seal the initial import window, it does not draw down the window byte total, and it does not apply the recent-day filter. It still drops dates before `INGEST_MIN_DATE`. On D1, a request that would run more than 45 statements returns `413` and names `node src/cli/import-apple-health.js --chunk-url`. SQLite and Postgres do not use that statement budget. Setup details are in [Data sources](https://github.com/Airbloomer/health-mcp/blob/main/docs/sources.md#health-auto-export).
+Repeating the same post upserts those rows. It does not insert a second copy. A later post that changes one reading updates that reading and rebuilds the daily total from every stored reading for that metric and day. Other readings from earlier posts stay.
+
+`GET /export` returns one page of any of those tables as JSON or CSV. It uses the same bearer token as `/summary`. The URL token cannot call it.
+
+## Recommended Health Auto Export settings
+
+Create one REST API automation per data type. Health Auto Export allows only one data type in each automation. Point every automation at `https://<your-host>/ingest` with the header `Authorization: Bearer <HEALTH_INGEST_TOKEN>`.
+
+- **Format:** JSON. **Export version:** Version 2.
+- **Health metrics:** select every metric you want, not only the daily summary list. Turn **Summarize Data** off when you want each reading (heart rate, sleep stages, nutrition with food names). Leave it on for a smaller daily total. The server keeps either shape.
+- **Sleep:** included with health metrics as `sleep_analysis`. Summarized nights store stage hours. Unsummarized exports store each stage segment.
+- **Workouts:** turn on **Include Workout Metrics** (minutes is enough for most questions; seconds is larger) and **Include Route Data** if you want the GPS track.
+- **Also create automations for** Symptoms, ECG, Heart Rate Notifications, State of Mind (iOS 18+), Cycle Tracking, and Medications (iOS 26+, with medication access). Same URL, header, JSON, and version.
+- **Sync frequency:** a few times a day is enough for ongoing sync. The default limit is 2,000 accepted posts per token per UTC hour (`INGEST_RATE_LIMIT_PER_HOUR`). Set it to `0` to turn the limit off. During the initial import window the cap is `INGEST_BACKFILL_MAX_PER_HOUR` (default 5,000).
+- **Batch requests:** turn them on for a large manual upload. Each request is stored on its own. Samples are merged by identity, so a day split across requests still becomes one daily total.
+- **Manual upload:** use it for history. Any start and end date is accepted while `INGEST_MAX_AGE_DAYS` is unset. Dates before `INGEST_MIN_DATE` (default `2000-01-01`) are dropped, and a date more than one day ahead is dropped. Set `INGEST_MAX_AGE_DAYS` to `1` if you want the old today-and-yesterday limit after the import window closes.
+- **Already deployed:** if the Worker var `INGEST_MAX_AGE_DAYS` is `1`, delete that var (or set it empty) and deploy again, or historical posts are still rejected. `0006` may already have closed the import window on a database that had rows. Closing that window does not block old dates unless `INGEST_MAX_AGE_DAYS` is set.
+
+JSON bodies may be up to 5 MB by default (`INGEST_MAX_BODY_BYTES`, and `INGEST_BACKFILL_MAX_BYTES` while the import window is open, never above 10 MB). One request may cover at most 366 distinct dates, so a long manual upload should be several date ranges or use batch requests.
+
+An Apple Health `export.xml` can still be imported with `POST /import/apple-health` (Node) or `POST /import/apple-health/chunk`. That path is unchanged: it does not open or close the import window, and on D1 a request that would run more than 45 statements returns `413`.
+
+## MCP
+
+`/mcp` is a stateless [Streamable HTTP](https://developers.cloudflare.com/agents/model-context-protocol/protocol/transport/) endpoint built with `createMcpHandler` from the Cloudflare Agents SDK (`agents/mcp/server`) and `@modelcontextprotocol/server`. A fresh server is created for each request. The tools only read D1 (or SQLite, or Postgres), so there is no Durable Object and no session to resume. Send `Authorization: Bearer <HEALTH_INGEST_TOKEN>`. Browser `Origin` values are still limited by `MCP_ALLOWED_ORIGINS`.
+
+| Tool | What it returns |
+| --- | --- |
+| `get_daily_summary` | The `GET /summary` object for one day. |
+| `get_metric` | One metric from `start_date` to `end_date`. `granularity` is `raw`, `day` (default), `week`, or `month`. |
+| `list_metrics` | Metric names that have a daily row. |
+| `list_coverage` | Every stored metric and data type, with first date, last date, and row count. |
+| `get_sleep` | Sleep summaries and stage segments. |
+| `get_workout` | Workouts, including heart rate, route, and metadata when they were stored. |
+| `list_workouts` | Workout name, start, duration, and energy only. |
+| `get_records` | `kind` is `symptoms`, `ecg`, `heart_rate_notifications`, `state_of_mind`, `cycle_tracking`, or `medications`. |
+| `summarize_dates` | One summary per day in a range, plus totals for the summed metrics. |
+| `export_health` | One page of `samples`, `daily`, `sleep`, `workouts`, or `records`, as JSON or CSV. |
+
+A date range is at most 366 days. A page is at most 500 rows. When more rows exist, the tool returns `next_cursor`. Pass that value back as `cursor`.
+
+`GET /export` takes the same filters as query parameters: `dataset`, `format` (`json` or `csv`), `metric`, `kind`, `start`, `end`, `cursor`, and `limit` (at most 2,000).
 
 ## Ingest limits
 
-The first accepted ingest opens an initial import window. There is no separate setup step. Keeping past dates is limited to Health Auto Export JSON on `POST /ingest`. The raised JSON body cap and the higher hourly cap apply to JSON ingest routes while the window is open. Each of those bodies may be up to `INGEST_BACKFILL_MAX_BYTES` (default 5,000,000, and never above 10,000,000), and each token may send `INGEST_BACKFILL_MAX_PER_HOUR` posts (default 60). Import history in chunks of that size or less. The hint text uses the configured cap, and the default wording is 5 MB. The window still rejects a date more than one day ahead, and a date before `INGEST_MIN_DATE` (default `2000-01-01`). A configured minimum before `1970-01-01` is raised to that day, a configured minimum after today is lowered to today in UTC, and a value that is not a real calendar day uses the default. A JSON ingest request may cover at most 366 distinct dates. A total of `INGEST_BACKFILL_MAX_TOTAL_BYTES` (default 500,000,000) applies to non-Apple JSON bodies while the window is open. An Apple Health import does not draw that total down. Unchanged days are still skipped.
+The first accepted ingest opens an initial import window. There is no separate setup step. The raised hourly cap applies to JSON ingest routes while the window is open. Each JSON body may be up to `INGEST_BACKFILL_MAX_BYTES` (default 5,000,000, and never above 10,000,000), and each token may send `INGEST_BACKFILL_MAX_PER_HOUR` posts (default 5,000). Import history in chunks of that size or less. The hint text uses the configured cap, and the default wording is 5 MB. The window still rejects a date more than one day ahead, and a date before `INGEST_MIN_DATE` (default `2000-01-01`). A configured minimum before `1970-01-01` is raised to that day, a configured minimum after today is lowered to today in UTC, and a value that is not a real calendar day uses the default. A JSON ingest request may cover at most 366 distinct dates. A total of `INGEST_BACKFILL_MAX_TOTAL_BYTES` (default 500,000,000) applies to non-Apple JSON bodies while the window is open. An Apple Health import does not draw that total down. Unchanged days are still skipped.
 
 A request whose `content-type` does not contain `json` stays on the steady size cap. An Apple Health export on `POST /ingest` uses the 20,000,000 byte cap, not the import-window per-request cap.
 
-The window closes for good at the first of these: the deadline stored when it opened (`INGEST_BACKFILL_HOURS`, default 72), the total stored when it opened, or a request with `"backfill": "done"` or the header `X-Backfill: done`. Changing those settings later does not extend a window that is already open, and it does not reopen a closed one. A database that already holds points, workouts, or raw payloads receives a closed row when its schema is updated, so those rows do not start a window. A database that already has non-Apple data and no window row is treated as closed. An Apple Health import does not open, close, or seal the window, and it does not draw down the window byte total. An Apple import before the first accepted ingest still lets that ingest open the window. On D1, one request may run at most 45 statements. `INGEST_MAX_STATEMENTS` can only lower that ceiling. A Health Auto Export request over the budget returns `413` and names `POST /import/apple-health/chunk`. SQLite and Postgres do not apply this budget. A missing row is not an open window, and a response before that row exists reports it closed. A failed write does not reopen a closed window. Postgres keeps each request's reservation and its writes on one connection, so a failure rolls all of them back. SQLite and D1 keep the bytes for each group that was stored. After the window is closed, `bytes_remaining` is 0 and the steady limits apply again: today and yesterday, `INGEST_MAX_BODY_BYTES` (default 1,000,000), and `INGEST_RATE_LIMIT_PER_HOUR` (default 6). Every ingest response includes `backfill` with `open`, `closes_at`, and `bytes_remaining`. A chunk that is too large during the window returns `413` and asks for a shorter date range. After the window is closed, an old date returns `422` and an oversized or too-frequent post returns `413` or `429`, and the message says the initial import window is closed.
+The window closes for good at the first of these: the deadline stored when it opened (`INGEST_BACKFILL_HOURS`, default 72), the total stored when it opened, or a request with `"backfill": "done"` or the header `X-Backfill: done`. Changing those settings later does not extend a window that is already open, and it does not reopen a closed one. A database that already holds points, workouts, or raw payloads receives a closed row when its schema is updated, so those rows do not start a window. A database that already has non-Apple data and no window row is treated as closed. An Apple Health import does not open, close, or seal the window, and it does not draw down the window byte total. An Apple import before the first accepted ingest still lets that ingest open the window. On D1, one request may run at most 45 statements. `INGEST_MAX_STATEMENTS` can only lower that ceiling. A Health Auto Export request over the budget returns `413` and names `POST /import/apple-health/chunk`. SQLite and Postgres do not apply this budget. A missing row is not an open window, and a response before that row exists reports it closed. A failed write does not reopen a closed window. Postgres keeps each request's reservation and its writes on one connection, so a failure rolls all of them back. SQLite and D1 keep the bytes for each group that was stored. After the window is closed, `bytes_remaining` is 0 and the steady limits apply again: `INGEST_MAX_BODY_BYTES` (default 5,000,000) and `INGEST_RATE_LIMIT_PER_HOUR` (default 2,000). Old dates stay accepted unless `INGEST_MAX_AGE_DAYS` is set. Every ingest response includes `backfill` with `open`, `closes_at`, and `bytes_remaining`. A chunk that is too large during the window returns `413` and asks for a shorter date range. After the window is closed, a date outside a configured `INGEST_MAX_AGE_DAYS` returns `422`, and an oversized or too-frequent post returns `413` or `429`.
 
 `MemoryStorage` keeps this window in the process only. It is not persistent. A new process has no row and no stored data, so the next stored point can open a window. A restart does not keep a closed window.
 
 ## Troubleshooting
 
-- **The chatbot or phone app says unauthorized (`401`).** Check that the header is exactly `Bearer`, one space, then the token. The URL token works only on three `POST` routes: the two Android webhook routes (`/ingest/hc-webhook`, `/ingest/life-dashboard`) and `/ingest/shortcuts`. It never works for `/mcp` or `/summary`.
+- **The chatbot or phone app says unauthorized (`401`).** Check that the header is exactly `Bearer`, one space, then the token. The URL token works only on three `POST` routes: the two Android webhook routes (`/ingest/hc-webhook`, `/ingest/life-dashboard`) and `/ingest/shortcuts`. It never works for `/mcp`, `/summary`, or `/export`.
 - **Sending data fails right after deploying.** Run `node src/cli/d1-migrate.js --remote` (or `--local` for a local database), then `npx wrangler deploy` again.
 - **A day is missing or shows up on the wrong date.** Set `HEALTH_TIMEZONE` in `wrangler.toml` to your zone, then run `npx wrangler deploy` again.
 - **Totals look too low.** Send whole days. On the app routes that compare sample counts, a later sync with fewer samples for a day does not replace a fuller one. A Shortcuts daily total sent with the Bearer token replaces the day. See [Data sources](https://github.com/Airbloomer/health-mcp/blob/main/docs/sources.md).

@@ -7,7 +7,18 @@ import { MemoryStorage } from "../src/core/memory.js";
 import { expectedSummary, summaryDate } from "./expected.mjs";
 
 const sample = JSON.parse(fs.readFileSync(new URL("./sample.json", import.meta.url), "utf8"));
-const TOOL_NAMES = ["get_daily_summary", "get_metric", "list_metrics", "list_workouts"];
+const TOOL_NAMES = [
+  "get_daily_summary",
+  "get_metric",
+  "list_metrics",
+  "list_coverage",
+  "get_sleep",
+  "get_records",
+  "get_workout",
+  "summarize_dates",
+  "export_health",
+  "list_workouts",
+];
 
 function request(pathname, { method = "GET", token = "tok", body, accept } = {}) {
   const headers = new Headers();
@@ -66,7 +77,7 @@ test("mcp lists only read tools and serves each one", async () => {
   });
   assert.equal(init.status, 200);
   assert.equal(init.body.result.protocolVersion, "2025-06-18");
-  assert.equal(init.body.result.capabilities.tools.listChanged, false);
+  assert.equal(init.body.result.capabilities.tools.listChanged, true);
   assert.equal(init.body.result.serverInfo.name, "health-mcp");
 
   const listed = await call(ctx, "tools/list");
@@ -149,12 +160,12 @@ test("mcp validates tool arguments and protocol messages", async () => {
   assert.equal(huge.isError, true);
   assert.match(huge.content[0].text, /366 days/);
 
-  const notObject = await tool(ctx, "list_metrics", ["nope"]);
-  assert.equal(notObject.isError, true);
+  const notObject = await call(ctx, "tools/call", { name: "list_metrics", arguments: ["nope"] });
+  assert.equal(notObject.body.error.code, -32602);
 
   const unknown = await call(ctx, "tools/call", { name: "delete_day", arguments: { date: summaryDate } });
   assert.equal(unknown.body.error.code, -32602);
-  assert.equal(unknown.body.error.message, "unknown tool");
+  assert.match(unknown.body.error.message, /delete_day/);
   assert.equal(storage.points.size, before);
 
   const missing = await call(ctx, "resources/list");
@@ -188,11 +199,11 @@ test("mcp validates tool arguments and protocol messages", async () => {
   const stream = await handleRequest(request("/mcp", {
     method: "POST",
     body: rpc("ping"),
-    accept: "text/event-stream",
+    accept: "application/json, text/event-stream",
   }), ctx);
   assert.equal(stream.status, 200);
-  assert.match(stream.headers.get("content-type"), /text\/event-stream/);
-  assert.match(await stream.text(), /"result":\{\}/);
+  assert.match(stream.headers.get("content-type"), /application\/json/);
+  assert.deepEqual((await stream.json()).result, {});
 
   const plain = await handleRequest(request("/mcp", { method: "POST", body: rpc("ping"), accept: "text/plain" }), ctx);
   assert.equal(plain.status, 406);
@@ -228,15 +239,16 @@ test("mcp rejects an Origin that is not allowlisted", async () => {
   assert.equal(elsewhere.status, 403);
 });
 
-test("mcp falls back to protocol 2025-06-18", async () => {
+test("mcp negotiates the protocol version the client requests", async () => {
   const ctx = { token: "tok", storage: new MemoryStorage() };
   assert.equal(MCP_PROTOCOL_VERSION, "2025-06-18");
-  const missing = await call(ctx, "initialize", {});
-  assert.equal(missing.body.result.protocolVersion, "2025-06-18");
-  const unknown = await call(ctx, "initialize", { protocolVersion: "2024-11-05" });
-  assert.equal(unknown.body.result.protocolVersion, "2025-06-18");
-  const supported = await call(ctx, "initialize", { protocolVersion: "2025-03-26" });
+  const client = { capabilities: {}, clientInfo: { name: "test", version: "0" } };
+  const current = await call(ctx, "initialize", { protocolVersion: "2025-06-18", ...client });
+  assert.equal(current.body.result.protocolVersion, "2025-06-18");
+  const supported = await call(ctx, "initialize", { protocolVersion: "2025-03-26", ...client });
   assert.equal(supported.body.result.protocolVersion, "2025-03-26");
+  const older = await call(ctx, "initialize", { protocolVersion: "2024-11-05", ...client });
+  assert.equal(older.body.result.protocolVersion, "2024-11-05");
 });
 
 test("mcp rejects a body over 64KB before reading and aborts the stream", async () => {

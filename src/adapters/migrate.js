@@ -3,17 +3,26 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { splitStatements } from "./statements.js";
 
-const migrationsDir = fileURLToPath(new URL("../../migrations/", import.meta.url));
+// Resolved on first use. Building the migrations URL at module load throws
+// Invalid URL string in the Worker bundle, before any request runs.
+function migrationsDirectory() {
+  const metaUrl = import.meta.url;
+  if (typeof metaUrl !== "string" || metaUrl.length === 0) {
+    throw new Error("migrations directory is unavailable in this runtime");
+  }
+  return fileURLToPath(new URL("../../migrations/", metaUrl));
+}
 
 /** SQL files in `migrations/`, oldest first. Each file runs once. */
 export function migrationFiles() {
+  const migrationsDir = migrationsDirectory();
   return fs
     .readdirSync(migrationsDir)
     .filter((name) => name.endsWith(".sql"))
     .sort()
     .map((name) => ({
       id: name,
-      sql: fs.readFileSync(path.join(migrationsDir, name), "utf8"),
+      sql: fs.readFileSync(path.join(migrationsDirectory(), name), "utf8"),
     }));
 }
 

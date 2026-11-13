@@ -187,13 +187,15 @@ test("a 7-day all-metrics upload writes fewer than 200 rows", async () => {
 
   const storedMetrics = db.prepare("SELECT COUNT(*) AS n FROM points_daily").get().n;
   const extras = db.prepare("SELECT COUNT(*) AS n FROM points_daily WHERE metric LIKE 'extra_metric_%'").get().n;
+  const sampleRows = db.prepare("SELECT COUNT(*) AS n FROM samples").get().n;
   const workouts = db.prepare("SELECT COUNT(*) AS n FROM workouts").get().n;
-  assert.equal(extras, 0);
-  assert.equal(storedMetrics, 7 * (Object.keys(SUM_METRICS).length + Object.keys(LATEST_METRICS).length));
+  assert.equal(extras, 7 * 40);
+  assert.equal(storedMetrics, 7 * (Object.keys(SUM_METRICS).length + Object.keys(LATEST_METRICS).length + 40));
+  assert.equal(sampleRows, sampleCount);
   assert.equal(workouts, 14);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM raw_payloads").get().n, 0);
-  assert.ok(writes.n < 20, `used ${writes.n} statements`);
-  assert.ok(writes.n < storedMetrics);
+  assert.ok(writes.n < 80, `used ${writes.n} statements`);
+  assert.ok(writes.n * 20 < sampleCount, `used ${writes.n} statements for ${sampleCount} samples`);
 
   const day = await (await fetchAt(
     new Request("http://example.test/summary?date=2026-10-08", { headers: { authorization: "Bearer tok" } }),
@@ -219,7 +221,7 @@ test("a 7-day all-metrics upload writes fewer than 200 rows", async () => {
   db.close();
 });
 
-test("a partial re-send does not overwrite the full-day total", async () => {
+test("a partial re-send updates that sample and keeps the other samples", async () => {
   const db = new Database(":memory:");
   applySqliteMigrations(db);
   sealBackfill(db);
@@ -255,9 +257,9 @@ test("a partial re-send does not overwrite the full-day total", async () => {
     new Request("http://example.test/summary?date=2026-10-14", { headers: { authorization: "Bearer tok" } }),
     env,
   )).json();
-  assert.equal(summary.steps, 6000);
+  assert.equal(summary.steps, 5005);
   const row = db.prepare("SELECT sum_qty, n FROM points_daily WHERE date = ? AND metric = ?").get("2026-10-14", "step_count");
-  assert.deepEqual(row, { sum_qty: 6000, n: 3 });
+  assert.deepEqual(row, { sum_qty: 5005, n: 3 });
   db.close();
 });
 

@@ -39,6 +39,72 @@ export function workoutJson(workout) {
     d: workout.date,
     m: workout.duration_min,
     k: workout.kcal,
+    e: workout.end_ts ?? null,
+    src: workout.source ?? null,
+    detail: workout.detail ?? null,
+  };
+}
+
+export function sampleJson(row) {
+  return {
+    id: row.id,
+    m: row.metric,
+    ts: row.ts,
+    d: row.date,
+    e: row.end_ts,
+    q: row.qty,
+    min: row.min_qty,
+    max: row.max_qty,
+    avg: row.avg_qty,
+    u: row.units,
+    src: row.source,
+    v: row.value,
+    g: row.grain,
+    x: row.extra,
+    sig: row.sig,
+  };
+}
+
+export function sleepJson(row) {
+  return {
+    id: row.id,
+    d: row.date,
+    k: row.kind,
+    s: row.start_ts,
+    e: row.end_ts,
+    ibs: row.in_bed_start,
+    ibe: row.in_bed_end,
+    total: row.total_hr,
+    asleep: row.asleep_hr,
+    bed: row.in_bed_hr,
+    core: row.core_hr,
+    deep: row.deep_hr,
+    rem: row.rem_hr,
+    awake: row.awake_hr,
+    stage: row.stage,
+    src: row.source,
+    sig: row.sig,
+  };
+}
+
+export function recordJson(row) {
+  return {
+    id: row.id,
+    k: row.kind,
+    ts: row.ts,
+    d: row.date,
+    n: row.name,
+    src: row.source,
+    p: row.payload,
+    sig: row.sig,
+  };
+}
+
+export function healthWriteChunks(sampleRows, sleepRows, recordRows) {
+  return {
+    samples: jsonChunks((sampleRows || []).map(sampleJson)),
+    sleep: jsonChunks((sleepRows || []).map(sleepJson)),
+    records: jsonChunks((recordRows || []).map(recordJson)),
   };
 }
 

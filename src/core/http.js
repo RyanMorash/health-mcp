@@ -15,7 +15,9 @@ import {
   backfillStatus,
   backfillTotalBody,
   beforeMinDateBody,
+  filterDated,
   filterRecent,
+  recencyBounds,
   hourWindowStart,
   outsideWindowBody,
   payloadTooLargeBody,
@@ -33,6 +35,8 @@ import {
 import { isLifeDashboard, lifeDashboardError, parseLifeDashboard } from "./life-dashboard.js";
 import { declaredContentLength, handleMcp, MCP_SERVER_NAME } from "./mcp.js";
 import { DEFAULT_TIME_ZONE, MAX_APPLE_EXPORT_BYTES, MAX_PAYLOAD_CHARS } from "./metrics.js";
+import { exportDataset } from "./export.js";
+import { identifyHealth } from "./hae.js";
 import { parse, payloadError } from "./parse.js";
 import { parseShortcuts, shortcutDays, shortcutsError, shortcutsSourcePriority } from "./shortcuts.js";
 import { parseSyncFit, syncFitError } from "./syncfit.js";
@@ -377,6 +381,7 @@ export async function handleRequest(req, ctx) {
   if (ingestKind(url.pathname) === "life-dashboard" && req.method === "POST") return ingestLifeDashboard(req, ctx);
   if (ingestKind(url.pathname) === "shortcuts" && req.method === "POST") return ingestShortcuts(req, ctx);
   if (url.pathname === "/summary" && req.method === "GET") return summary(url, ctx.storage);
+  if (url.pathname === "/export" && req.method === "GET") return exportData(url, ctx.storage);
   if (url.pathname === "/mcp") return handleMcp(req, ctx);
   return json({ error: "not_found" }, 404);
 }
@@ -460,6 +465,7 @@ async function insertGroup(ctx, batch, group, index, nowIso, client) {
   const key = group[group.length - 1];
   const groupId = `${key}/${nowIso}/${crypto.randomUUID().slice(0, 8)}`;
   const storeRaw = index === 0 && shouldStoreRaw({ storeRaw: ctx.storeRaw, payload: batch.payload });
+  const inGroup = (row) => set.has(row.date);
   const counts = await ctx.storage.insertIngest({
     id: groupId,
     date: key,
@@ -467,8 +473,11 @@ async function insertGroup(ctx, batch, group, index, nowIso, client) {
     bytes: index === 0 ? batch.bytes : 0,
     payload: storeRaw ? batch.payload : null,
     storeRaw,
-    points: (batch.points || []).filter((point) => set.has(point.date)),
-    workouts: (batch.workouts || []).filter((workout) => set.has(workout.date)),
+    points: (batch.points || []).filter(inGroup),
+    workouts: (batch.workouts || []).filter(inGroup),
+    sampleRows: (batch.sampleRows || []).filter(inGroup),
+    sleepRows: (batch.sleepRows || []).filter(inGroup),
+    recordRows: (batch.recordRows || []).filter(inGroup),
   }, {
     hint: index === 0 ? batch.hint : undefined,
     hintKnown: index === 0 ? Boolean(batch.hintKnown) : false,
@@ -519,6 +528,8 @@ async function chargeGroups(ctx, batch, state, groups, dates, now, client) {
       dates,
       points: batch.samples,
       workouts: (batch.workouts || []).length,
+      sleep: (batch.sleepRows || []).length,
+      records: (batch.recordRows || []).length,
       written,
       unchanged,
       ...batch.extra,
@@ -529,8 +540,13 @@ async function chargeGroups(ctx, batch, state, groups, dates, now, client) {
 async function storeIngest(ctx, batch, state = null, claim = null) {
   const points = batch.points || [];
   const workouts = batch.workouts || [];
-  const dates = [...new Set([...points.map((point) => point.date), ...workouts.map((workout) => workout.date)])].sort();
-  const willKeep = points.length + workouts.length > 0;
+  const extraRows = [...(batch.sampleRows || []), ...(batch.sleepRows || []), ...(batch.recordRows || [])];
+  const dates = [...new Set([
+    ...points.map((point) => point.date),
+    ...workouts.map((workout) => workout.date),
+    ...extraRows.map((row) => row.date),
+  ])].sort();
+  const willKeep = points.length + workouts.length + extraRows.length > 0;
   const relaxed = Boolean(state && (state.view.open || state.pending));
   const charge = willCharge(batch, state);
   if (batch.dateCap !== false && dates.length > MAX_INGEST_DATES) {
@@ -577,6 +593,8 @@ async function storeIngest(ctx, batch, state = null, claim = null) {
       dates,
       points: batch.samples,
       workouts: workouts.length,
+      sleep: (batch.sleepRows || []).length,
+      records: (batch.recordRows || []).length,
       written,
       unchanged,
       ...batch.extra,
@@ -993,14 +1011,35 @@ async function ingestShortcuts(req, ctx) {
   }, state, claim);
 }
 
+function restrictMetrics(ctx, hae) {
+  const configured = ctx.metricAllowlist != null && String(ctx.metricAllowlist).trim() !== "";
+  if (!hae || configured) return storedMetricSet(ctx.metricAllowlist);
+  return null;
+}
+
+function keepAllowed(rows, allow, metricOf) {
+  if (!allow) return rows || [];
+  return (rows || []).filter((row) => allow.has(metricOf(row)));
+}
+
 async function storeParsed(req, ctx, parsed, text, state, { recency = false, bytes = null, claim = null } = {}) {
-  let points = parsed.points;
-  let workouts = parsed.workouts;
+  let points = parsed.points || [];
+  let workouts = parsed.workouts || [];
+  let sampleRows = parsed.samples || [];
+  let sleepRows = parsed.sleep || [];
+  let recordRows = parsed.records || [];
   let extra;
   let hint = null;
   const minDate = resolveMinDate(ctx.ingestMinDate, { now: state.now, timeZone: ctx.timeZone });
   if (recency) {
     const configuredHint = exportHint(state.limits.maxBytes);
+    const bounds = recencyBounds({
+      now: state.now,
+      timeZone: resolveTimeZone(ctx.timeZone),
+      maxAgeDays: resolveMaxAgeDays(ctx.ingestMaxAgeDays),
+      keepPast: Boolean(state.view.open || state.pending),
+      minDate,
+    });
     const filtered = filterRecent(points, workouts, {
       now: state.now,
       timeZone: resolveTimeZone(ctx.timeZone),
@@ -1008,31 +1047,50 @@ async function storeParsed(req, ctx, parsed, text, state, { recency = false, byt
       keepPast: Boolean(state.view.open || state.pending),
       minDate,
     });
-    const nothing = filtered.points.length === 0 && filtered.workouts.length === 0;
-    if (nothing && filtered.dropped_early > 0) {
+    const samples = filterDated(sampleRows, bounds);
+    const sleep = filterDated(sleepRows, bounds);
+    const records = filterDated(recordRows, bounds);
+    // Samples mirror metric points, so they are not counted again. Records and
+    // sleep count only when the payload has no dated points or workouts.
+    const droppedStale = filtered.dropped_stale || records.dropped_stale + sleep.dropped_stale;
+    const droppedFuture = filtered.dropped_future || records.dropped_future + sleep.dropped_future;
+    const droppedEarly = filtered.dropped_early || records.dropped_early + sleep.dropped_early;
+    const nothing = filtered.points.length + filtered.workouts.length + samples.kept.length + sleep.kept.length + records.kept.length === 0;
+    if (nothing && droppedEarly > 0) {
       await ctx.storage.setExportHint(configuredHint);
       return respond(beforeMinDateBody(minDate), 422, clientView(state));
     }
-    if (nothing && !state.view.open && !state.pending && filtered.dropped_stale > 0) {
+    if (nothing && !state.view.open && !state.pending && droppedStale > 0) {
       await ctx.storage.setExportHint(configuredHint);
       return respond(outsideWindowBody(), 422, clientView(state));
     }
     points = filtered.points;
     workouts = filtered.workouts;
-    extra = {
-      dropped_stale: filtered.dropped_stale,
-      dropped_future: filtered.dropped_future,
-      dropped_early: filtered.dropped_early,
-    };
-    if (filtered.dropped_stale >= STALE_HINT_AT) hint = configuredHint;
+    sampleRows = samples.kept;
+    sleepRows = sleep.kept;
+    recordRows = records.kept;
+    extra = { dropped_stale: droppedStale, dropped_future: droppedFuture, dropped_early: droppedEarly };
+    if (droppedStale >= STALE_HINT_AT) hint = configuredHint;
   }
-  const allow = storedMetricSet(ctx.metricAllowlist);
-  const kept = points.filter((point) => allow.has(point.metric));
+  const allow = restrictMetrics(ctx, recency);
+  const kept = keepAllowed(points, allow, (point) => point.metric);
+  sampleRows = keepAllowed(sampleRows, allow, (row) => row.metric);
+  if (allow && !allow.has("sleep_analysis")) sleepRows = [];
+  const identified = await identifyHealth({
+    samples: sampleRows,
+    sleep: sleepRows,
+    records: recordRows,
+    workouts,
+    workoutMetaRows: parsed.workoutMetaRows || [],
+  });
   const size = bytes ?? utf8ByteLength(text);
   const payload = shouldStoreRaw({ storeRaw: ctx.storeRaw, payload: text }) ? text : null;
   return storeIngest(ctx, {
     points: aggregateDays(kept, allow),
-    workouts,
+    workouts: identified.workouts,
+    sampleRows: identified.sampleRows,
+    sleepRows: identified.sleepRows,
+    recordRows: identified.recordRows,
     samples: kept.length,
     bytes: size,
     payload,
@@ -1090,6 +1148,36 @@ async function importAppleChunk(req, ctx) {
     apple: true,
     statementPrefix: countedPrefix(state, null),
   }, state);
+}
+
+async function exportData(url, storage) {
+  const start = url.searchParams.get("start") || "1970-01-01";
+  const end = url.searchParams.get("end") || "9999-12-31";
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)) {
+    return json({ error: "invalid_query", message: "start and end must be YYYY-MM-DD" }, 400);
+  }
+  try {
+    const body = await exportDataset(storage, {
+      dataset: url.searchParams.get("dataset") || "daily",
+      format: url.searchParams.get("format") || "json",
+      metric: url.searchParams.get("metric"),
+      kind: url.searchParams.get("kind"),
+      start,
+      end,
+      cursor: url.searchParams.get("cursor") || "0",
+      limit: url.searchParams.get("limit") || 500,
+    });
+    if ((url.searchParams.get("format") || "json") === "csv") {
+      return new Response(body.csv || "", {
+        status: 200,
+        headers: { "content-type": "text/csv; charset=utf-8", "cache-control": "no-store" },
+      });
+    }
+    return json(body);
+  } catch (error) {
+    if (error?.code === "BAD_EXPORT") return json({ error: "invalid_query", message: error.message }, 400);
+    throw error;
+  }
 }
 
 async function summary(url, storage) {

@@ -1,4 +1,5 @@
 import { shouldStoreRaw } from "./aggregate.js";
+import { pointsAfterSamples, rowsToWrite } from "./health-rows.js";
 import { countNewDays, hintAction, partitionIngest, withExportHint } from "./ingest-guard.js";
 import { summarizeDay } from "./summary.js";
 
@@ -27,6 +28,9 @@ export class MemoryStorage {
     this.payloads = [];
     this.points = new Map();
     this.workouts = new Map();
+    this.samples = new Map();
+    this.sleep = new Map();
+    this.records = new Map();
     this.quota = new Map();
     this.exportHint = null;
     this.backfill = null;
@@ -205,12 +209,19 @@ export class MemoryStorage {
         payload: batch.payload,
       });
     }
+    const sampleRows = batch.sampleRows || [];
+    const sleepRows = batch.sleepRows || [];
+    const recordRows = batch.recordRows || [];
+    for (const row of rowsToWrite([...this.samples.values()], sampleRows)) this.samples.set(row.id, row);
+    for (const row of rowsToWrite([...this.sleep.values()], sleepRows)) this.sleep.set(row.id, row);
+    for (const row of rowsToWrite([...this.records.values()], recordRows)) this.records.set(row.id, row);
+    const points = pointsAfterSamples(batch.points, sampleRows, [...this.samples.values()]);
     const stored = {
       points: [...this.points.values()],
       workouts: [...this.workouts.values()],
     };
-    const diff = partitionIngest(batch.points, batch.workouts, stored);
-    const newDays = countNewDays(batch.points, batch.workouts, stored);
+    const diff = partitionIngest(points, batch.workouts, stored);
+    const newDays = countNewDays(points, batch.workouts, stored);
     for (const point of diff.points) {
       const { replace, ...stored } = point;
       this.points.set(`${point.date}\0${point.metric}`, stored);
@@ -250,5 +261,78 @@ export class MemoryStorage {
       .filter((workout) => workout.date >= startDate && workout.date <= endDate)
       .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.start < b.start ? -1 : a.start > b.start ? 1 : 0))
       .map((workout) => ({ ...workout }));
+  }
+
+  async querySamples(metric, start, end, limit, offset) {
+    return [...this.samples.values()]
+      .filter((row) => row.metric === metric && row.date >= start && row.date <= end)
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : a.id < b.id ? -1 : 1))
+      .slice(offset, offset + limit);
+  }
+
+  async querySleep(start, end, limit, offset) {
+    return [...this.sleep.values()]
+      .filter((row) => row.date >= start && row.date <= end)
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : String(a.start_ts || "") < String(b.start_ts || "") ? -1 : 1))
+      .slice(offset, offset + limit);
+  }
+
+  async queryRecords(kind, start, end, limit, offset) {
+    return [...this.records.values()]
+      .filter((row) => row.kind === kind && row.date >= start && row.date <= end)
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : String(a.ts || "") < String(b.ts || "") ? -1 : 1))
+      .slice(offset, offset + limit);
+  }
+
+  async queryWorkoutDetails(start, end, limit, offset) {
+    const rows = await this.listWorkouts(start, end);
+    return rows.slice(offset, offset + limit);
+  }
+
+  async queryPointsBetween(start, end) {
+    return [...this.points.values()]
+      .filter((point) => point.date >= start && point.date <= end)
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.metric < b.metric ? -1 : 1));
+  }
+
+  async listCoverage() {
+    const coverage = [];
+    const push = (kind, name, rows, dateOf = (row) => row.date) => {
+      if (!rows.length) return;
+      const dates = rows.map(dateOf).filter(Boolean).sort();
+      coverage.push({ kind, name: name || "", min_date: dates[0], max_date: dates[dates.length - 1], n: rows.length });
+    };
+    const byMetric = new Map();
+    for (const row of this.samples.values()) {
+      const list = byMetric.get(row.metric) || [];
+      list.push(row);
+      byMetric.set(row.metric, list);
+    }
+    for (const [metric, rows] of byMetric) push("metric", metric, rows);
+    const dailyOnly = new Map();
+    for (const point of this.points.values()) {
+      if (byMetric.has(point.metric)) continue;
+      const list = dailyOnly.get(point.metric) || [];
+      list.push(point);
+      dailyOnly.set(point.metric, list);
+    }
+    for (const [metric, rows] of dailyOnly) push("metric", metric, rows);
+    push("sleep", "", [...this.sleep.values()]);
+    const byWorkout = new Map();
+    for (const workout of this.workouts.values()) {
+      const list = byWorkout.get(workout.name) || [];
+      list.push(workout);
+      byWorkout.set(workout.name, list);
+    }
+    for (const [name, rows] of byWorkout) push("workout", name, rows);
+    const byRecord = new Map();
+    for (const record of this.records.values()) {
+      const key = `${record.kind}\0${record.name || ""}`;
+      const list = byRecord.get(key) || [];
+      list.push(record);
+      byRecord.set(key, list);
+    }
+    for (const [, rows] of byRecord) push(rows[0].kind, rows[0].name || "", rows);
+    return coverage;
   }
 }
