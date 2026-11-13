@@ -261,6 +261,13 @@ describe("import window", () => {
     const posts = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM ingest_receipt").first<{ n: number }>();
     expect(row?.bytes).toBe(size);
     expect(posts?.n).toBe(1);
+
+    await testEnv.DB.prepare("DELETE FROM ingest_window").run();
+    expect((await postJson("/ingest", body)).status).toBe(200);
+    const repaired = await testEnv.DB.prepare("SELECT bytes FROM ingest_window WHERE id = 1").first<{ bytes: number }>();
+    const postsAfter = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM ingest_receipt").first<{ n: number }>();
+    expect(repaired?.bytes).toBe(size);
+    expect(postsAfter?.n).toBe(1);
   });
 });
 

@@ -166,10 +166,19 @@ async function receiptFor(normalized: Normalized, close: boolean): Promise<strin
   return recordId(ids);
 }
 
+const WINDOW_FROM_RECEIPTS =
+  "INSERT INTO ingest_window (id, opened_at, closed_at, bytes, days, deadline, total_bytes) " +
+  "VALUES (1, ?, ?, (SELECT COALESCE(SUM(bytes), 0) FROM ingest_receipt WHERE touch_window = 1), " +
+  "(SELECT COALESCE(SUM(days), 0) FROM ingest_receipt WHERE touch_window = 1), ?, ?) " +
+  "ON CONFLICT(id) DO UPDATE SET " +
+  "bytes = (SELECT COALESCE(SUM(bytes), 0) FROM ingest_receipt WHERE touch_window = 1), " +
+  "days = (SELECT COALESCE(SUM(days), 0) FROM ingest_receipt WHERE touch_window = 1), " +
+  "closed_at = COALESCE(excluded.closed_at, ingest_window.closed_at)";
+
 /**
  * Record one Health Auto Export post. The receipt insert is the gate for the
- * hourly cap and the import byte total, so a retry of the same records does
- * not count again and two first posts cannot both insert the window row.
+ * hourly cap and the import byte total. The window is rewritten from those
+ * receipts, so a retry repairs a missed window write without adding the bytes again.
  */
 async function claimPost(db: D1Database, options: SaveOptions, receipt: string): Promise<"claimed" | "retry" | "rate_limited" | "over_budget"> {
   const nowIso = options.now.toISOString();
@@ -177,36 +186,28 @@ async function claimPost(db: D1Database, options: SaveOptions, receipt: string):
   const openedAt = options.state.row?.opened_at || nowIso;
   const deadline = options.state.row?.deadline || backfillClosesAt(openedAt, options.settings.backfill.hours);
   const total = options.state.row?.total_bytes ?? options.settings.backfill.totalBytes;
+  const touch = options.charge || options.close ? 1 : 0;
   const addBytes = options.charge ? options.bytes : 0;
   const addDays = options.charge ? distinctDates(options.normalized).length : 0;
   const closedAt = options.close ? nowIso : null;
   const rateLimit = options.countPost ? options.state.rateLimit : 0;
-  const chargeFlag = options.charge ? 1 : 0;
   const claimed = await db
     .prepare(
-      "INSERT INTO ingest_receipt (id, window_start, bytes) " +
-        "SELECT ?, ?, ? " +
+      "INSERT INTO ingest_receipt (id, window_start, bytes, days, touch_window) " +
+        "SELECT ?, ?, ?, ?, ? " +
         "WHERE (? = 0 OR (SELECT COUNT(*) FROM ingest_receipt WHERE window_start = ?) < ?) " +
-        "AND (? = 0 OR COALESCE((SELECT bytes FROM ingest_window WHERE id = 1), 0) + ? <= ?) " +
+        "AND (? = 0 OR COALESCE((SELECT SUM(bytes) FROM ingest_receipt WHERE touch_window = 1), 0) + ? <= ?) " +
         "ON CONFLICT(id) DO NOTHING RETURNING id",
     )
-    .bind(receipt, windowStart, addBytes, rateLimit, windowStart, rateLimit, chargeFlag, addBytes, total)
+    .bind(receipt, windowStart, addBytes, addDays, touch, rateLimit, windowStart, rateLimit, touch, addBytes, total)
     .first<{ id: string }>();
-  if (claimed?.id) {
-    if (options.charge || options.close) {
-      await db
-        .prepare(
-          "INSERT INTO ingest_window (id, opened_at, closed_at, bytes, days, deadline, total_bytes) VALUES (1, ?, ?, ?, ?, ?, ?) " +
-            "ON CONFLICT(id) DO UPDATE SET bytes = ingest_window.bytes + excluded.bytes, days = ingest_window.days + excluded.days, " +
-            "closed_at = COALESCE(excluded.closed_at, ingest_window.closed_at)",
-        )
-        .bind(openedAt, closedAt, addBytes, addDays, deadline, total)
-        .run();
+  const existing = claimed?.id ? null : await db.prepare("SELECT id FROM ingest_receipt WHERE id = ?").bind(receipt).first<{ id: string }>();
+  if (claimed?.id || existing) {
+    if (touch) {
+      await db.prepare(WINDOW_FROM_RECEIPTS).bind(openedAt, closedAt, deadline, total).run();
     }
-    return "claimed";
+    return claimed?.id ? "claimed" : "retry";
   }
-  const existing = await db.prepare("SELECT id FROM ingest_receipt WHERE id = ?").bind(receipt).first<{ id: string }>();
-  if (existing) return "retry";
   const posts = await db.prepare("SELECT COUNT(*) AS posts FROM ingest_receipt WHERE window_start = ?").bind(windowStart).first<{ posts: number }>();
   if (rateLimit > 0 && Number(posts?.posts || 0) >= rateLimit) return "rate_limited";
   return "over_budget";

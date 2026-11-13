@@ -68,7 +68,9 @@ CREATE TABLE ingest_window (
 CREATE TABLE ingest_receipt (
   id TEXT PRIMARY KEY,
   window_start INTEGER NOT NULL,
-  bytes INTEGER NOT NULL
+  bytes INTEGER NOT NULL,
+  days INTEGER NOT NULL DEFAULT 0,
+  touch_window INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX ingest_receipt_window ON ingest_receipt(window_start);
 
