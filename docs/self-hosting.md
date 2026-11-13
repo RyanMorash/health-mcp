@@ -12,7 +12,7 @@ npx wrangler d1 create health-mcp
 npx wrangler r2 bucket create health-mcp-series
 ```
 
-Copy the printed database id into `database_id` in [`wrangler.jsonc`](../wrangler.jsonc). The committed id is a placeholder so local tests can boot without an account.
+Copy the printed database id into `database_id` in [`wrangler.jsonc`](../wrangler.jsonc), and set `database_name` to match. This fork's committed values point at the live `health-mcp-v2` database.
 
 Set `HEALTH_TIMEZONE` in `vars` to an IANA zone, for example `America/Los_Angeles`. Sleep nights and the "today and yesterday" window use that zone. A timestamp that already has a numeric offset uses the offset.
 
@@ -22,7 +22,7 @@ npm run db:migrate
 npm run deploy
 ```
 
-`npm run db:migrate` runs `wrangler d1 migrations apply health-mcp --remote`.
+`npm run db:migrate` runs `wrangler d1 migrations apply DB --remote`.
 
 For local development, copy `.dev.vars.example` to `.dev.vars` and set the token, then `npm run dev`.
 
@@ -41,7 +41,7 @@ For local development, copy `.dev.vars.example` to `.dev.vars` and set the token
 
 | Var | Default | Meaning |
 | --- | --- | --- |
-| `HEALTH_TIMEZONE` | `America/Los_Angeles` | Calendar zone when a timestamp has no offset. |
+| `HEALTH_TIMEZONE` | `America/New_York` | Calendar zone when a timestamp has no offset. |
 | `MCP_ALLOWED_ORIGINS` | empty | Comma-separated origins allowed to call `/mcp`. Empty rejects any request that sends `Origin`. |
 | `INGEST_MAX_AGE_DAYS` | `1` | Days before today that a steady-state ingest may include. |
 | `INGEST_MAX_BODY_BYTES` | `1000000` | Steady-state body cap. |
