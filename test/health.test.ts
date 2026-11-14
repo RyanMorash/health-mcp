@@ -366,6 +366,173 @@ describe("MCP", () => {
   });
 });
 
+function utcDay(offset: number): string {
+  const now = new Date();
+  const date = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + offset));
+  return date.toISOString().slice(0, 10);
+}
+
+/** The Worker reads the clock itself. Wait out a UTC day or hour boundary so a date or receipt window cannot change mid-test. */
+async function awayFromClockBoundary(): Promise<void> {
+  const now = Date.now();
+  const hourLeft = 3_600_000 - (now % 3_600_000);
+  const dayLeft = 86_400_000 - (now % 86_400_000);
+  const wait = Math.min(hourLeft, dayLeft);
+  if (wait < 2_000) await new Promise((resolve) => setTimeout(resolve, wait + 50));
+}
+
+function stepPost(date: string, qty: number, hour = "12", offset = "+0000") {
+  return {
+    data: {
+      metrics: [{ name: "step_count", units: "count", data: [{ qty, date: `${date} ${hour}:00:00 ${offset}`, source: "iPhone" }] }],
+    },
+  };
+}
+
+describe("ingest date gates", () => {
+  it("keeps history only while the import window is open, and still drops early and future rows", async () => {
+    await awayFromClockBoundary();
+    const today = utcDay(0);
+    const yesterday = utcDay(-1);
+    const historic = "2010-06-15";
+    const early = "1999-12-31";
+    const future = utcDay(3);
+
+    const tooEarly = await postJson("/ingest", stepPost(early, 4));
+    expect(tooEarly.status).toBe(422);
+    const earlyBody = await tooEarly.json<{ error: string; message: string; dropped_early: number }>();
+    expect(earlyBody.error).toBe("outside_window");
+    expect(earlyBody.message).toContain("2000-01-01");
+    expect(earlyBody.dropped_early).toBe(1);
+    expect(await count("ingest_window")).toBe(0);
+
+    const mixed = await postJson("/ingest", {
+      data: {
+        metrics: [{
+          name: "step_count",
+          units: "count",
+          data: [
+            { qty: 11, date: `${historic} 08:00:00 +0000`, source: "iPhone" },
+            { qty: 22, date: `${today} 08:00:00 +0000`, source: "iPhone" },
+            { qty: 33, date: `${future} 08:00:00 +0000`, source: "iPhone" },
+            { qty: 44, date: `${early} 08:00:00 +0000`, source: "iPhone" },
+          ],
+        }],
+        ecg: [{
+          start: `${future} 12:00:00 +0000`,
+          end: `${future} 12:00:30 +0000`,
+          classification: "Sinus Rhythm",
+          voltageMeasurements: [0.1, 9.9, 0.1],
+          source: "Apple Watch",
+        }],
+      },
+    });
+    expect(mixed.status).toBe(200);
+    const mixedBody = await mixed.json<{ dates: string[]; dropped_early: number; dropped_future: number; events: number }>();
+    expect(mixedBody.dropped_early).toBe(1);
+    expect(mixedBody.dropped_future).toBe(2);
+    expect(mixedBody.events).toBe(0);
+    expect(mixedBody.dates).toEqual([historic, today]);
+    expect((await testEnv.SERIES.list()).objects).toEqual([]);
+    expect((await (await authed(`/summary?date=${historic}`)).json<{ steps: number }>()).steps).toBe(11);
+    expect((await (await authed(`/summary?date=${today}`)).json<{ steps: number }>()).steps).toBe(22);
+    const stray = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM samples WHERE date IN (?, ?)").bind(early, future).first<{ n: number }>();
+    expect(stray?.n).toBe(0);
+
+    expect((await postJson("/ingest", { backfill: "done" })).status).toBe(200);
+    const stale = await postJson("/ingest", stepPost(historic, 5, "09"));
+    expect(stale.status).toBe(422);
+    const staleBody = await stale.json<{ error: string; message: string; dropped_stale: number }>();
+    expect(staleBody.error).toBe("outside_window");
+    expect(staleBody.message).toContain("initial import window is closed");
+    expect(staleBody.dropped_stale).toBe(1);
+    expect((await (await authed(`/summary?date=${historic}`)).json<{ steps: number }>()).steps).toBe(11);
+
+    const offset = await postJson("/ingest", stepPost(yesterday, 9, "23", "-0800"));
+    expect(offset.status).toBe(200);
+    const dated = await testEnv.DB.prepare("SELECT date FROM samples WHERE qty = 9").first<{ date: string }>();
+    expect(dated?.date).toBe(yesterday);
+    expect((await (await authed(`/summary?date=${today}`)).json<{ steps: number }>()).steps).toBe(22);
+  });
+
+  it("imports a historic Apple chunk without opening the phone window", async () => {
+    await awayFromClockBoundary();
+    const future = utcDay(4);
+    const response = await postJson("/import/apple-health/chunk", {
+      samples: [
+        { metric: "step_count", date: "1998-01-02", start_ts: "1998-01-02 12:00:00 +0000", source: "Apple Watch", qty: 1, units: "count", kind: "sum" },
+        { metric: "step_count", date: "2012-04-04", start_ts: "2012-04-04 12:00:00 +0000", source: "Apple Watch", qty: 2, units: "count", kind: "sum" },
+        { metric: "step_count", date: future, start_ts: `${future} 12:00:00 +0000`, source: "Apple Watch", qty: 3, units: "count", kind: "sum" },
+      ],
+      workouts: [],
+      events: [],
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json<{ samples: number; dates: string[]; dropped_early: number; dropped_future: number }>();
+    expect(body).toMatchObject({ samples: 1, dates: ["2012-04-04"], dropped_early: 1, dropped_future: 1 });
+    const rows = await testEnv.DB.prepare("SELECT date, qty FROM samples").all<{ date: string; qty: number }>();
+    expect(rows.results).toEqual([{ date: "2012-04-04", qty: 2 }]);
+    expect(await count("ingest_window")).toBe(0);
+    expect(await count("ingest_receipt")).toBe(0);
+  });
+});
+
+describe("ingest auth and quota", () => {
+  it("rejects a missing, wrong, or prefixed bearer token", async () => {
+    async function summary(authorization?: string) {
+      const headers = new Headers();
+      if (authorization !== undefined) headers.set("authorization", authorization);
+      return SELF.fetch("https://health-mcp.test/summary?date=2024-02-29", { headers });
+    }
+
+    for (const header of [undefined, "Bearer", "Bearer wrong-token", "Bearer test", "Basic test-token", "Bearer test-token extra"]) {
+      const response = await summary(header);
+      expect(response.status, header ?? "absent").toBe(401);
+      expect(response.headers.get("www-authenticate")).toContain('Bearer realm="health-mcp"');
+    }
+    expect((await summary("bearer test-token")).status).toBe(200);
+    expect((await summary("Bearer   test-token  ")).status).toBe(200);
+  });
+
+  it("rejects a calendar date that is not a real day", async () => {
+    expect((await authed("/summary?date=2023-02-29")).status).toBe(400);
+    expect((await authed("/summary?date=2024-02-31")).status).toBe(400);
+    const leap = await authed("/summary?date=2024-02-29");
+    expect(leap.status).toBe(200);
+    expect(await leap.json<{ date: string }>()).toMatchObject({ date: "2024-02-29" });
+  });
+
+  it("stops steady-state posts for the rest of the hour once the receipt cap is full", async () => {
+    await awayFromClockBoundary();
+    const today = utcDay(0);
+    const windowStart = Math.floor(Date.now() / 3_600_000) * 3_600_000;
+    const opened = new Date(windowStart).toISOString();
+    await testEnv.DB
+      .prepare("INSERT INTO ingest_window (id, opened_at, closed_at, bytes, days, deadline, total_bytes) VALUES (1, ?, ?, 0, 0, ?, 500000000)")
+      .bind(opened, opened, new Date(windowStart + 72 * 3_600_000).toISOString())
+      .run();
+    await testEnv.DB.batch(
+      Array.from({ length: 6 }, (_, index) =>
+        testEnv.DB.prepare("INSERT INTO ingest_receipt (id, window_start, bytes, days, touch_window) VALUES (?, ?, 0, 0, 0)").bind(`seed-${index}`, windowStart),
+      ),
+    );
+
+    const blocked = await postJson("/ingest", stepPost(today, 999, "10"));
+    expect(blocked.status).toBe(429);
+    expect(await blocked.json<{ error: string }>()).toMatchObject({ error: "rate_limited" });
+    const retry = Number(blocked.headers.get("retry-after"));
+    expect(retry).toBeGreaterThan(0);
+    expect(retry).toBeLessThanOrEqual(3600);
+    expect(await testEnv.DB.prepare("SELECT qty FROM samples WHERE qty = 999").first()).toBeNull();
+    expect(await count("ingest_receipt")).toBe(6);
+
+    await testEnv.DB.prepare("UPDATE ingest_receipt SET window_start = ?").bind(windowStart - 3_600_000).run();
+    expect((await postJson("/ingest", stepPost(today, 8, "11"))).status).toBe(200);
+    const stored = await testEnv.DB.prepare("SELECT date, qty FROM samples WHERE qty = 8").first<{ date: string; qty: number }>();
+    expect(stored).toEqual({ date: today, qty: 8 });
+  });
+});
+
 const WATCH = "Ryan\u2019s Apple Watch";
 const PHONE = "Ryan\u2019s iPhone";
 
