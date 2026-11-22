@@ -32,7 +32,7 @@ npm run deploy
 
 `openssl rand -hex 32` is a reasonable token. Copy `.dev.vars.example` to `.dev.vars` for `wrangler dev`.
 
-Health Auto Export can send `Authorization: Bearer <token>`. Add one REST automation per data type, JSON, version 2, today and yesterday. Leave routes and per-second workout series off unless you want `get_series`. Details are in [docs/sources.md](docs/sources.md).
+Health Auto Export can send `Authorization: Bearer <token>`. Add one REST automation per data type, JSON, version 2, with a range of the last 7 days so a missed upload is included in a later one. Leave routes and per-second workout series off unless you want `get_series`. Details are in [docs/sources.md](docs/sources.md).
 
 ## Historic Apple import
 
@@ -56,7 +56,7 @@ Browser clients must send an `Origin` that is listed in `MCP_ALLOWED_ORIGINS`. C
 
 ## Limits
 
-Steady state keeps today and yesterday (`INGEST_MAX_AGE_DAYS`, default 1). The first accepted ingest opens an initial import window (72 hours, 60 requests an hour, 5 MB per request, 500 MB total, unless you change the vars). Send `{"backfill":"done"}` or `X-Backfill: done` when the phone has caught up. Dates before `INGEST_MIN_DATE` are dropped.
+Steady state keeps today and the previous 7 days (`INGEST_MAX_AGE_DAYS`, default 7). A post may be up to 10 MB (`INGEST_MAX_BODY_BYTES`). The first accepted ingest opens an initial import window (72 hours, 60 requests an hour, 500 MB total, unless you change the vars). While that window is open, each post may be as large as the bigger of the steady-state cap and `INGEST_BACKFILL_MAX_BYTES`. Send `{"backfill":"done"}` or `X-Backfill: done` when the phone has caught up. Dates before `INGEST_MIN_DATE` are dropped.
 
 D1's free plan returns 429 until the next UTC midnight after a daily row limit. The Worker surfaces that as `error: daily_limit`.
 

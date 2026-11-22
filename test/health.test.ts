@@ -1,6 +1,7 @@
 /// <reference types="@cloudflare/vitest-plugin/types" />
 import { env, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import { shiftIsoDate } from "../src/dates.js";
 import { AppleExportError, parseAppleExport } from "../src/parse/apple.js";
 import { metricRollup } from "../src/storage.js";
 
@@ -268,6 +269,43 @@ describe("import window", () => {
     const postsAfter = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM ingest_receipt").first<{ n: number }>();
     expect(repaired?.bytes).toBe(size);
     expect(postsAfter?.n).toBe(1);
+  });
+
+  it("keeps a missed day inside the last 7 days and a metrics body over 1 MB", async () => {
+    expect((await postJson("/ingest", HAE)).status).toBe(200);
+    expect((await postJson("/ingest", { backfill: "done" })).status).toBe(200);
+
+    const today = new Date().toISOString().slice(0, 10);
+    const within = shiftIsoDate(today, -2);
+    const edge = shiftIsoDate(today, -7);
+    const tooOld = shiftIsoDate(today, -8);
+    const steps = (day: string, qty: number) => ({
+      data: { metrics: [{ name: "step_count", units: "count", data: [{ qty, date: `${day} 12:00:00 +0000`, source: "iPhone" }] }] },
+    });
+
+    expect((await postJson("/ingest", steps(within, 20))).status).toBe(200);
+    expect((await postJson("/ingest", steps(edge, 21))).status).toBe(200);
+    const stale = await postJson("/ingest", steps(tooOld, 22));
+    expect(stale.status).toBe(422);
+    const staleBody = await stale.json<{ error: string; message: string }>();
+    expect(staleBody.error).toBe("outside_window");
+    expect(staleBody.message).toContain("previous 7 days");
+
+    const bulky = {
+      data: {
+        metrics: [{ name: "step_count", units: "count", data: [{ qty: 30, date: `${today} 12:00:00 +0000`, source: "iPhone" }] }],
+        pad: "x".repeat(1_100_000),
+      },
+    };
+    expect(new TextEncoder().encode(JSON.stringify(bulky)).byteLength).toBeGreaterThan(1_000_000);
+    expect((await postJson("/ingest", bulky)).status).toBe(200);
+
+    const over = await authed("/ingest", {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": "10000001" },
+      body: "{}",
+    });
+    expect(over.status).toBe(413);
   });
 });
 

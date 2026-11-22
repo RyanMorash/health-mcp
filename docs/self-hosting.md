@@ -14,7 +14,7 @@ npx wrangler r2 bucket create health-mcp-series
 
 Copy the printed database id into `database_id` in [`wrangler.jsonc`](../wrangler.jsonc), and set `database_name` to match. This fork's committed values point at the live `health-mcp-v2` database.
 
-Set `HEALTH_TIMEZONE` in `vars` to an IANA zone, for example `America/Los_Angeles`. Sleep nights and the "today and yesterday" window use that zone. A timestamp that already has a numeric offset uses the offset.
+Set `HEALTH_TIMEZONE` in `vars` to an IANA zone, for example `America/Los_Angeles`. Sleep nights and the steady-state window (today and the previous 7 days) use that zone. A timestamp that already has a numeric offset uses the offset.
 
 ```bash
 npx wrangler secret put HEALTH_INGEST_TOKEN
@@ -43,8 +43,8 @@ For local development, copy `.dev.vars.example` to `.dev.vars` and set the token
 | --- | --- | --- |
 | `HEALTH_TIMEZONE` | `America/New_York` | Calendar zone when a timestamp has no offset. |
 | `MCP_ALLOWED_ORIGINS` | empty | Comma-separated origins allowed to call `/mcp`. Empty rejects any request that sends `Origin`. |
-| `INGEST_MAX_AGE_DAYS` | `1` | Days before today that a steady-state ingest may include. |
-| `INGEST_MAX_BODY_BYTES` | `1000000` | Steady-state body cap. |
+| `INGEST_MAX_AGE_DAYS` | `7` | Days before today that a steady-state ingest may include. `7` is today and the previous 7 days, so a missed day or two is still in the next scheduled upload. |
+| `INGEST_MAX_BODY_BYTES` | `10000000` | Steady-state body cap. Hard maximum 10 MB. Metrics for several days can pass 1 MB. |
 | `INGEST_RATE_LIMIT_PER_HOUR` | `6` | Steady-state posts per hour. `0` turns it off. |
 | `INGEST_BACKFILL_HOURS` | `72` | How long the initial import stays open. |
 | `INGEST_BACKFILL_MAX_BYTES` | `5000000` | Per-request cap during the import, and the cap for Apple chunks. Hard maximum 10 MB. |

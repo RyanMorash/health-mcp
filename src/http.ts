@@ -12,6 +12,7 @@ import {
   secondsUntilNextHour,
   settingsFromEnv,
   STALE_HINT_AT,
+  steadyStateRange,
   type Settings,
 } from "./limits.js";
 import { mcpHandler } from "./mcp.js";
@@ -99,7 +100,7 @@ async function ingest(req: Request, env: Env, settings: Settings, now: Date): Pr
         error: "payload_too_large",
         message: during
           ? `Body exceeds ${state.byteLimit} bytes. Send a shorter date range. ${chunkHint(settings.backfill.maxBytes)}`
-          : `Body exceeds ${state.byteLimit} bytes. ${INITIAL_IMPORT_CLOSED} Send a shorter range, such as today and yesterday.`,
+          : `Body exceeds ${state.byteLimit} bytes. ${INITIAL_IMPORT_CLOSED} Send a shorter range. Steady state accepts ${steadyStateRange(settings.maxAgeDays)}.`,
       },
       state,
       413,
@@ -168,7 +169,7 @@ async function ingest(req: Request, env: Env, settings: Settings, now: Date): Pr
   if (!kept && (filtered.droppedStale || filtered.droppedEarly || filtered.droppedFuture)) {
     const message = filtered.droppedEarly
       ? `Dates before ${settings.minDate} are not accepted.`
-      : `${INITIAL_IMPORT_CLOSED} Send today and yesterday.`;
+      : `${INITIAL_IMPORT_CLOSED} Send ${steadyStateRange(settings.maxAgeDays)}.`;
     return withBackfill({ error: "outside_window", message, ...dropCounts(filtered) }, state, 422);
   }
   if (!kept) {
