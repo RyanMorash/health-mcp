@@ -9,10 +9,10 @@ Create one REST API automation per data type. HealthyApps documents the catalog 
 - Request: `POST https://<worker>/ingest`
 - Header: `Authorization: Bearer <HEALTH_INGEST_TOKEN>`
 - Body: JSON, version 2
-- Range: today and yesterday, once the initial import is finished
+- Range: last 7 days, once the initial import is finished. Today and yesterday leaves a gap when two uploads in a row are missed.
 - Routes, per-second workout series, and beat-to-beat HRV: off, unless you want to read them later with `get_series`
 
-The first accepted post opens the initial import window, so a backfill of older days is allowed until the window closes. Close it with a post whose body is `{"backfill":"done"}`, or with the header `X-Backfill: done`. After that, days older than yesterday are rejected with `422`.
+The first accepted post opens the initial import window, so a backfill of older days is allowed until the window closes. Close it with a post whose body is `{"backfill":"done"}`, or with the header `X-Backfill: done`. After that, days older than 7 days before today are rejected with `422`. A metrics post may be up to 10 MB. If one automation is still larger than that, split those metrics across more than one automation.
 
 A later post of the same sample replaces it. Identity is the metric, time, source, and label, not the quantity, so a correction does not stack a second row.
 

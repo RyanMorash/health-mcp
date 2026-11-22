@@ -1,9 +1,9 @@
 import { isRealIsoDate, localDate, resolveTimeZone, shiftIsoDate, utcToday } from "./dates.js";
 import type { Normalized } from "./types.js";
 
-export const DEFAULT_INGEST_MAX_AGE_DAYS = 1;
+export const DEFAULT_INGEST_MAX_AGE_DAYS = 7;
 export const MAX_INGEST_MAX_AGE_DAYS = 36500;
-export const DEFAULT_INGEST_MAX_BODY_BYTES = 1_000_000;
+export const DEFAULT_INGEST_MAX_BODY_BYTES = 10_000_000;
 export const MAX_PAYLOAD_BYTES = 10_000_000;
 export const DEFAULT_INGEST_RATE_PER_HOUR = 6;
 export const DEFAULT_INGEST_BACKFILL_MAX_BYTES = 5_000_000;
@@ -98,6 +98,13 @@ export function settingsFromEnv(env: Env, now = new Date()): Settings {
     minDate: resolveMinDate(env.INGEST_MIN_DATE, now),
     allowedOrigins: origins,
   };
+}
+
+/** Dates a steady-state Health Auto Export automation may include. */
+export function steadyStateRange(maxAgeDays: number): string {
+  if (maxAgeDays <= 0) return "today";
+  if (maxAgeDays === 1) return "today and yesterday";
+  return `today and the previous ${maxAgeDays} days`;
 }
 
 export function byteLabel(maxBytes: number): string {
