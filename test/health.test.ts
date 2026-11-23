@@ -2,6 +2,13 @@
 import { env, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { shiftIsoDate } from "../src/dates.js";
+import {
+  DEFAULT_INGEST_MAX_AGE_DAYS,
+  DEFAULT_INGEST_MAX_BODY_BYTES,
+  resolveMaxAgeDays,
+  resolveMaxBodyBytes,
+  steadyStateRange,
+} from "../src/limits.js";
 import { AppleExportError, parseAppleExport } from "../src/parse/apple.js";
 import { metricRollup } from "../src/storage.js";
 
@@ -271,11 +278,26 @@ describe("import window", () => {
     expect(postsAfter?.n).toBe(1);
   });
 
-  it("keeps a missed day inside the last 7 days and a metrics body over 1 MB", async () => {
+  it("keeps a missed day inside the last 7 days and a body over the 5 MB import cap", async () => {
     expect((await postJson("/ingest", HAE)).status).toBe(200);
-    expect((await postJson("/ingest", { backfill: "done" })).status).toBe(200);
 
     const today = new Date().toISOString().slice(0, 10);
+    const pad = "x".repeat(5_100_000);
+    const bulky = (qty: number) => ({
+      data: {
+        metrics: [{ name: "step_count", units: "count", data: [{ qty, date: `${today} 12:00:00 +0000`, source: "iPhone" }] }],
+        pad,
+      },
+    });
+    const open = bulky(30);
+    const openBytes = new TextEncoder().encode(JSON.stringify(open)).byteLength;
+    expect(openBytes).toBeGreaterThan(5_000_000);
+    expect(openBytes).toBeLessThanOrEqual(10_000_000);
+    expect((await postJson("/ingest", open)).status).toBe(200);
+    expect((await (await authed(`/summary?date=${today}`)).json<{ steps: number | null }>()).steps).toBe(30);
+
+    expect((await postJson("/ingest", { backfill: "done" })).status).toBe(200);
+
     const within = shiftIsoDate(today, -2);
     const edge = shiftIsoDate(today, -7);
     const tooOld = shiftIsoDate(today, -8);
@@ -290,15 +312,22 @@ describe("import window", () => {
     const staleBody = await stale.json<{ error: string; message: string }>();
     expect(staleBody.error).toBe("outside_window");
     expect(staleBody.message).toContain("previous 7 days");
+    expect((await (await authed(`/summary?date=${within}`)).json<{ steps: number | null }>()).steps).toBe(20);
+    expect((await (await authed(`/summary?date=${edge}`)).json<{ steps: number | null }>()).steps).toBe(21);
+    expect((await (await authed(`/summary?date=${tooOld}`)).json<{ steps: number | null }>()).steps).toBeNull();
 
-    const bulky = {
-      data: {
-        metrics: [{ name: "step_count", units: "count", data: [{ qty: 30, date: `${today} 12:00:00 +0000`, source: "iPhone" }] }],
-        pad: "x".repeat(1_100_000),
-      },
-    };
-    expect(new TextEncoder().encode(JSON.stringify(bulky)).byteLength).toBeGreaterThan(1_000_000);
-    expect((await postJson("/ingest", bulky)).status).toBe(200);
+    const steady = bulky(31);
+    expect(new TextEncoder().encode(JSON.stringify(steady)).byteLength).toBeGreaterThan(5_000_000);
+    expect((await postJson("/ingest", steady)).status).toBe(200);
+    expect((await (await authed(`/summary?date=${today}`)).json<{ steps: number | null }>()).steps).toBe(31);
+
+    const atCap = await authed("/ingest", {
+      method: "POST",
+      headers: { "content-type": "application/json", "content-length": "10000000" },
+      body: "{}",
+    });
+    expect(atCap.status).toBe(400);
+    expect((await atCap.json<{ error: string }>()).error).toBe("invalid_payload");
 
     const over = await authed("/ingest", {
       method: "POST",
@@ -306,6 +335,24 @@ describe("import window", () => {
       body: "{}",
     });
     expect(over.status).toBe(413);
+    const overBody = await over.json<{ error: string; message: string }>();
+    expect(overBody.error).toBe("payload_too_large");
+    expect(overBody.message).toContain("10000000");
+    expect(overBody.message).toContain("previous 7 days");
+  }, 30_000);
+});
+
+describe("steady-state limit defaults", () => {
+  it("uses a 7-day window and a 10 MB body when those settings are omitted", () => {
+    expect(DEFAULT_INGEST_MAX_AGE_DAYS).toBe(7);
+    expect(DEFAULT_INGEST_MAX_BODY_BYTES).toBe(10_000_000);
+    expect(resolveMaxAgeDays(undefined)).toBe(7);
+    expect(resolveMaxAgeDays("")).toBe(7);
+    expect(resolveMaxBodyBytes(undefined)).toBe(10_000_000);
+    expect(resolveMaxBodyBytes("0")).toBe(10_000_000);
+    expect(steadyStateRange(0)).toBe("today");
+    expect(steadyStateRange(1)).toBe("today and yesterday");
+    expect(steadyStateRange(7)).toBe("today and the previous 7 days");
   });
 });
 
